@@ -24,7 +24,7 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, flag_state_after_block,
-                     detect_seh_helpers,
+                     detect_seh_helpers, _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width)
 
 
@@ -41,15 +41,59 @@ def _merge_flag_states(states):
     first = states[0]
     if all(state == first for state in states[1:]):
         return first
-    if first[0] not in ("cmp", "test") or len(first[1]) != 2:
+    if first[0] in ("cmp", "test") and len(first[1]) == 2:
+        width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+        for kind, ops in states[1:]:
+            if kind != first[0] or len(ops) != 2:
+                return None
+            if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
+                return None
+        return first
+    return _merge_zero_flag(states)
+
+
+def _merge_zero_flag(states):
+    """Predecessors that disagree on the operation but not on the zero flag.
+
+    `sub eax, ecx` reaching a loop head by fall-through and `dec eax` reaching
+    it by the back edge are different setters, so the state cannot be
+    inherited as itself -- yet both leave ZF as (eax == 0), which is the whole
+    of what a je or jne there is asking.
+
+    Unlike the CMP/TEST merge above, these reconstruct their operands rather
+    than reading a snapshot, so the merge only survives when every predecessor
+    names the same destination register. The name carries the width, so
+    `dec al` and `sub eax, ecx` do not merge.
+
+    The marker is deliberately narrow: only ZF is answerable from it, and
+    _make_condition refuses everything else.
+    """
+    from .lifter import ZF_FROM_DEST
+    dests = set()
+    for setter, ops in states:
+        if setter not in ZF_FROM_DEST or not ops:
+            return None
+        op = ops[0]
+        # disasm.Operand, not a capstone operand: .type is the string "reg".
+        if getattr(op, "type", None) != "reg" or not op.reg:
+            return None
+        dests.add(op.reg)
+    if len(dests) != 1:
         return None
-    width = _operand_width(first[1][0]) or _operand_width(first[1][1])
-    for kind, ops in states[1:]:
-        if kind != first[0] or len(ops) != 2:
-            return None
-        if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
-            return None
-    return first
+    return ("__zf_from_dest", [states[0][1][0]])
+
+
+def _incoming_flag_state(sources, known, is_entry):
+    """The flag state a block inherits, or None when it cannot be known.
+
+    A predecessor with no computed state yet makes the result unknown rather
+    than guessed: that costs a fallback condition and never a wrong one.
+    """
+    if is_entry or not sources:
+        return None
+    if not all(p in known for p in sources):
+        return None
+    return _merge_flag_states([known[p] for p in sources])
 
 
 def write_if_changed(path, text):
@@ -251,6 +295,18 @@ def load_coalescences(path):
         })
     return parsed
 
+def _seh_prologs_of(lifter):
+    """Every __SEH_prolog address a lifter knows about, as a set.
+
+    Reads SEH_PROLOGS when present and falls back to the scalar SEH_PROLOG,
+    so a lifter stub that only sets the old attribute still works -- the test
+    suite builds exactly such a stub, and so may callers outside this repo.
+    """
+    prologs = getattr(lifter, "SEH_PROLOGS", None)
+    if prologs:
+        return set(prologs)
+    one = getattr(lifter, "SEH_PROLOG", None)
+    return {one} if one is not None else set()
 
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
@@ -958,7 +1014,7 @@ class FunctionTranslator:
     @staticmethod
     def _function_needs_cf(instructions):
         """True when something in the function reads CF."""
-        from .lifter import (FLAG_SETTERS, CF_TRACKED,
+        from .lifter import (FLAG_SETTERS, CF_TRACKED, BT_MODIFY,
                              _EFLAGS_SETTERS, _FLAGS_UNDEFINED)
 
         last_setter = None
@@ -974,7 +1030,9 @@ class FunctionTranslator:
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
-                    and (last_setter in CF_TRACKED or last_setter in ("inc", "dec"))):
+                    and (last_setter in CF_TRACKED
+                         or last_setter in ("inc", "dec")
+                         or last_setter in BT_MODIFY)):
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
@@ -1010,10 +1068,10 @@ class FunctionTranslator:
         """
         if self._func_has_prologue(instructions):
             return True
-        seh_prolog = getattr(self.lifter, "SEH_PROLOG", None)
-        if seh_prolog is None:
+        seh_prologs = _seh_prologs_of(self.lifter)
+        if not seh_prologs:
             return False
-        return any(getattr(insn, "call_target", None) == seh_prolog
+        return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
     def _indirect_code_refs(self, instructions, start, end, proof_mode=False,
@@ -1744,8 +1802,10 @@ class FunctionTranslator:
         # hardcoded to one game's CRT here, so for every other title the forcing
         # silently never fired and the generated C failed to compile with
         # "'ebp': undeclared identifier".
-        seh_funcs = {a for a in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG)
-                     if a is not None}
+        seh_funcs = _seh_prologs_of(self.lifter)
+        epilog = getattr(self.lifter, "SEH_EPILOG", None)
+        if epilog is not None:
+            seh_funcs = seh_funcs | {epilog}
         if seh_funcs and any(insn.call_target in seh_funcs
                              for insn in instructions):
             used_regs.add("ebp")
@@ -1857,6 +1917,7 @@ class FunctionTranslator:
         # because eax may be replaced before the branch reads the result.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
                                  "lock cmpxchg", "inc", "dec")
+               or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
@@ -1973,48 +2034,29 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
-        # Solve block-entry flag provenance independently of emission order.
-        # Computed edges can jump backward to a lower-address block, so an
-        # address-ordered single pass can encounter the consumer before its
-        # real predecessor. Propagate predecessor contributions to a fixed point
-        # first, then lift every block with its settled incoming snapshot.
-        blocks_by_start = {bb.start: bb for bb in blocks}
-        flag_successors = {bb.start: set() for bb in blocks}
-        for successor, sources in preds.items():
-            for source in sources:
-                if source in flag_successors:
-                    flag_successors[source].add(successor)
-
-        flag_in_state = {start: None}
+        # Settle flag provenance before emission. Include every decoded block,
+        # even one that is unreachable from the entry, because it is still a
+        # structural predecessor and must keep a conflicting join conservative.
+        # Use the pure state helper so probing does not mutate lifter reporting.
         flag_out_state = {}
-        flag_contributions = {}
         missing = object()
-        worklist = [start] if start in blocks_by_start else []
-        while worklist:
-            address = worklist.pop()
-            bb = blocks_by_start[address]
-            incoming = flag_in_state[address]
-            outgoing = flag_state_after_block(bb, incoming)
-            if (address in flag_out_state
-                    and flag_out_state[address] == outgoing):
-                continue
-            flag_out_state[address] = outgoing
+        while True:
+            changed = False
+            for bb in blocks:
+                incoming = _incoming_flag_state(
+                    preds[bb.start], flag_out_state, bb.start == start)
+                outgoing = flag_state_after_block(bb, incoming)
+                if flag_out_state.get(bb.start, missing) != outgoing:
+                    flag_out_state[bb.start] = outgoing
+                    changed = True
+            if not changed:
+                break
 
-            for successor in flag_successors[address]:
-                # A function entry is also reachable from the host dispatcher,
-                # where incoming guest flags are unspecified. Preserve that
-                # conservative boundary even when guest code loops to start.
-                if successor == start:
-                    continue
-                contributions = flag_contributions.setdefault(successor, {})
-                if contributions.get(address, missing) == outgoing:
-                    continue
-                contributions[address] = outgoing
-                merged = _merge_flag_states(list(contributions.values()))
-                if (successor not in flag_in_state
-                        or flag_in_state[successor] != merged):
-                    flag_in_state[successor] = merged
-                    worklist.append(successor)
+        flag_in_state = {
+            bb.start: _incoming_flag_state(
+                preds[bb.start], flag_out_state, bb.start == start)
+            for bb in blocks
+        }
 
         for bb in blocks:
             # Emit label if this block is a branch target
@@ -2225,18 +2267,25 @@ class BatchTranslator:
         # Detect once here so the result can be reported and overridden from
         # the command line without retaining an address of a removed fragment.
         if seh_prolog is None or seh_epilog is None:
-            found_prolog, found_epilog = detect_seh_helpers(
+            found_prologs, found_epilog = detect_seh_helpers(
                 helper_func_db, self.xbe_data, verbose=True)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
+            seh_prolog = seh_prolog if seh_prolog is not None else found_prologs
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
-        self.seh_prolog = seh_prolog
+        seh_prologs = tuple(sorted(_as_addr_set(seh_prolog)))
+        self.seh_prolog = (None if not seh_prologs else
+                           seh_prologs[0] if len(seh_prologs) == 1 else
+                           seh_prologs)
         self.seh_epilog = seh_epilog
 
         setjmp_fn, longjmp_fn = detect_setjmp_helpers(
             helper_func_db, self.xbe_data, verbose=True)
 
-        self.translator.lifter.SEH_PROLOG = seh_prolog
+        seh_prologs = frozenset(seh_prologs)
+        self.translator.lifter.SEH_PROLOGS = seh_prologs
+        self.translator.lifter.SEH_PROLOG = min(seh_prologs) if seh_prologs else None
         self.translator.lifter.SEH_EPILOG = seh_epilog
+        self.translator.lifter.SEH_HELPERS = seh_prologs | (
+            {seh_epilog} if seh_epilog is not None else set())
         self.translator.lifter.SETJMP_FN = setjmp_fn
         self.translator.lifter.LONGJMP_FN = longjmp_fn
         if not coalesce_json_paths:
