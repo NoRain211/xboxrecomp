@@ -87,7 +87,10 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
     uint64_t end = (uint64_t)va + bytes;
     uint64_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
-    if (va < XBOX_FS_BASE)      /* page zero is deliberately unmapped */
+    /* Not XBOX_FS_BASE: that is the calling thread's TIB, and a spawned
+     * thread's TIB comes from the heap, so every buffer below it -- image
+     * data, stacks, older heap blocks -- would be refused on that thread. */
+    if (va < XBOX_TIB_MAIN)     /* page zero is deliberately unmapped */
         return 0;
     if (end <= mapped)
         return 1;
