@@ -56,6 +56,21 @@ def test_repaired_clamp_matches_unsplit_translation():
     assert split.func_db[BASE]["detection_method"] == "external_coalescence"
 
 
+def test_shared_clamp_branch_is_threaded_on_the_jump_edge():
+    subject = translator()
+    subject.coalesce_function(BASE, END, SPLITS)
+    code = subject.translate_function(BASE, subject.func_db[BASE])
+    assert code.count("/* cmp eax, edi (32-bit) */") == 2
+    assert code.count("if (CMP_GE(_fas, _fbs)) goto loc_00010018;") == 2
+    jump_path, fallthrough_path = code.split("loc_0001000D: ;")
+    assert "CMP_GE(_fas, _fbs)" in jump_path
+    assert "goto loc_00010016;" in jump_path
+    assert "CMP_GE(_fas, _fbs)" in fallthrough_path
+    assert "if (_flags" not in code
+    assert list(subject.func_db) == [BASE]
+    assert subject.func_db[BASE]["end"] == END
+
+
 def test_rejects_previously_coalesced_interior_owner():
     subject = translator()
     subject.coalesce_function(SPLITS[0], END, SPLITS[1:])

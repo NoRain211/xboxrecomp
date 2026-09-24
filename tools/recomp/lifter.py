@@ -3646,7 +3646,7 @@ def flag_state_after_block(bb, flag_state=None):
     return state
 
 
-def lift_basic_block(lifter, bb, flag_state=None):
+def lift_basic_block(lifter, bb, flag_state=None, threaded_jcc=None):
     """
     Lift a basic block to C statements.
     Tracks flags to generate proper conditions for jcc/setcc/cmovcc.
@@ -3656,6 +3656,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
         bb: BasicBlock with instructions
         flag_state: tuple of (flag_setter_mnemonic, flag_operands) from
                     a preceding block, or None
+        threaded_jcc: shared conditional to emit at this block's direct jump
 
     Returns:
         (stmts, flag_state) where stmts is a list of C statement strings
@@ -3739,6 +3740,21 @@ def lift_basic_block(lifter, bb, flag_state=None):
                     f"if ({cond}) "
                     + _fmt_operand_write(curr.operands[0], src)
                     + f" /* {curr.mnemonic} */")
+                i += 1
+                continue
+
+        # Read this edge's snapshots even if registers changed since CMP.
+        if (curr.mnemonic == "jmp" and threaded_jcc is not None
+                and last_flag_setter):
+            result = _make_condition(
+                threaded_jcc.mnemonic, last_flag_setter, last_flag_ops)
+            if result and threaded_jcc.jump_target is not None:
+                cond_expr, desc = result
+                stmts.append(_emit_cond_goto(
+                    cond_expr, threaded_jcc.mnemonic, desc,
+                    threaded_jcc.jump_target, lifter))
+                stmts.append(f"goto loc_{threaded_jcc.end_address:08X};"
+                             f" /* threaded {threaded_jcc.mnemonic} fallthrough */")
                 i += 1
                 continue
 

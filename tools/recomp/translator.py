@@ -2421,6 +2421,7 @@ class FunctionTranslator:
             for bb in blocks
         }
 
+        blocks_by_start = {bb.start: bb for bb in blocks}
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -2432,8 +2433,20 @@ class FunctionTranslator:
                 lines.append(f"loc_{bb.start:08X}: ;")
 
             incoming = flag_in_state.get(bb.start)
+            # Resolve a shared conditional on the jumping predecessor's flags,
+            # before the join can discard that edge's provenance.
+            threaded_jcc = None
+            last = bb.last_insn
+            target_bb = blocks_by_start.get(last.jump_target) if last else None
+            if (last and last.mnemonic == "jmp" and target_bb
+                    and len(preds[target_bb.start]) > 1):
+                first = target_bb.instructions[0]
+                if (first.is_cond_jump
+                        and first.end_address in blocks_by_start):
+                    threaded_jcc = first
             stmts, _ = lift_basic_block(
-                self.lifter, bb, flag_state=incoming)
+                self.lifter, bb, flag_state=incoming,
+                threaded_jcc=threaded_jcc)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
