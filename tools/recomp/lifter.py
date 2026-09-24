@@ -1542,6 +1542,10 @@ class Lifter:
             return ["recomp_debug_service(eax, ecx); /* int 0x2d */"]
         if m == "int3":
             return ["/* int3: debug-trap slide byte, stepped over */"]
+        # Guest EIP/CS/EFLAGS restore is not modelled, so reaching an interrupt
+        # return stops at a named site instead of refusing the whole program.
+        if m in ("iret", "iretd"):
+            return [f"__debugbreak(); return; /* {m}: interrupt return not modelled */"]
         if m in ("leave",):
             return ["esp = ebp;", "POP32(esp, ebp); /* leave */"]
         if m in ("cld", "std"):

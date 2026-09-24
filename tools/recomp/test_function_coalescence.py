@@ -399,8 +399,8 @@ def test_interrupt_return_is_terminal_for_recovery_and_emission(iret):
         subject.coalesce_function(BASE, BASE + len(body), [interior])
 
     whole = translator(body, [])
-    with pytest.raises(ValueError, match="Unsupported interrupt return"):
-        whole.translate_function(BASE, whole.func_db[BASE])
+    code = whole.translate_function(BASE, whole.func_db[BASE])
+    assert "__debugbreak(); return;" in code
 
 
 def test_xbox_int2d_int3_slide_preserves_fallthrough():
