@@ -21,7 +21,8 @@ import sys
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
-from .lifter import Lifter, lift_basic_block, detect_seh_helpers
+from .lifter import (Lifter, carry_crosses_blocks, lift_basic_block,
+                     detect_seh_helpers)
 
 
 def _fixup_icall_esp_save(lines):
@@ -1104,6 +1105,7 @@ class FunctionTranslator:
                     label_addrs.add(t)
 
         flag_state = None
+        self.lifter.cross_block_carry = carry_crosses_blocks(self.lifter, blocks)
         # A direct local jump can enter a conditional block whose flags come
         # from that jump's source. Address-order emission would otherwise
         # thread the later fallthrough block's flag state into the join.

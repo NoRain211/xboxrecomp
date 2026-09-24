@@ -319,7 +319,7 @@ def _emit_carry_capture(m, ops, dst, src):
     if m in ("sub", "cmp"):
         return [f"_cf = ((uint32_t)({dst} & 0x{mask:X}u)"
                 f" < (uint32_t)({src} & 0x{mask:X}u)); /* {m} borrow */"]
-    if m in ("and", "or", "test"):
+    if m in ("and", "or", "xor", "test"):
         return [f"_cf = 0; /* {m} clears carry */"]
     return []
 
@@ -1075,6 +1075,7 @@ class Lifter:
         self.func_end = 0
         self.current_function_has_ebp = False
         self.mmx_enabled = True
+        self.cross_block_carry = False
         self.jump_table_targets = {}
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
@@ -2456,6 +2457,25 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
+def _flags_preserve(lifter):
+    return (_EFLAGS_PRESERVE if lifter.mmx_enabled else
+            _EFLAGS_PRESERVE - {"cvtps2pi", "pavgb"})
+
+
+def carry_crosses_blocks(lifter, blocks):
+    """True when a block opens with an ADC/SBB, so its carry comes from
+    another block.
+
+    _carry_is_consumed stops at a branch, so "cmp dl, bl / jne L ... L: sbb
+    eax, eax" never published the compare's carry and the sbb read a stale
+    _cf. The translator then has every carry producer in the function
+    publish _cf.
+    """
+    flags_preserve = _flags_preserve(lifter)
+    return any(_carry_is_consumed(bb.instructions, -1, flags_preserve)
+               for bb in blocks)
+
+
 def lift_basic_block(lifter, bb, flag_state=None, threaded_jumps=None):
     """
     Lift a basic block to C statements.
@@ -2475,8 +2495,7 @@ def lift_basic_block(lifter, bb, flag_state=None, threaded_jumps=None):
     """
     stmts = []
     insns = bb.instructions
-    flags_preserve = (_EFLAGS_PRESERVE if lifter.mmx_enabled else
-                      _EFLAGS_PRESERVE - {"cvtps2pi", "pavgb"})
+    flags_preserve = _flags_preserve(lifter)
     i = 0
 
     # Track the last instruction that set flags
@@ -2538,10 +2557,15 @@ def lift_basic_block(lifter, bb, flag_state=None, threaded_jumps=None):
         match = try_match_cmp_jcc(insns, i, lifter=lifter)
         if match:
             stmt, consumed = match
-            stmts.append(stmt)
             # Preserve the flag-setter from the cmp/test since jcc
             # doesn't modify flags - subsequent jcc can reuse them
             flag_insn = insns[i]
+            if lifter.cross_block_carry:
+                lift = (lifter._lift_cmp if flag_insn.mnemonic == "cmp"
+                        else lifter._lift_test)
+                stmts.extend(lift(flag_insn, flag_insn.operands,
+                                  preserve_carry=True))
+            stmts.append(stmt)
             last_flag_setter = flag_insn.mnemonic
             last_flag_ops = list(flag_insn.operands)
             clobbered = set()
@@ -2631,7 +2655,8 @@ def lift_basic_block(lifter, bb, flag_state=None, threaded_jumps=None):
         # ADD 0x7FFFFFFF / ADC that implements the CRT's _ftol2 rounding.
         # Look ahead over EFLAGS-preserving instructions for the consumer.
         if (curr.mnemonic in _CARRY_PRODUCERS
-                and _carry_is_consumed(insns, i, flags_preserve)):
+                and (lifter.cross_block_carry
+                     or _carry_is_consumed(insns, i, flags_preserve))):
             if curr.mnemonic == "neg":
                 results = lifter._lift_neg(
                     curr, curr.operands, preserve_carry=True)
