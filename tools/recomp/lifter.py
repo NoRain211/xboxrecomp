@@ -304,6 +304,79 @@ def _fmt_operand_write(op, value_expr):
     return f"/* cannot write to {op.type} */;"
 
 
+# Width of an operand in bits, used to compute a carry-out. Register names
+# carry their own width; memory operands report it in bytes.
+_REG_BITS = {
+    "eax": 32, "ebx": 32, "ecx": 32, "edx": 32,
+    "esi": 32, "edi": 32, "ebp": 32, "esp": 32,
+    "ax": 16, "bx": 16, "cx": 16, "dx": 16,
+    "si": 16, "di": 16, "bp": 16, "sp": 16,
+    "al": 8, "bl": 8, "cl": 8, "dl": 8,
+    "ah": 8, "bh": 8, "ch": 8, "dh": 8,
+}
+
+
+def _operand_bits(op):
+    """Operand width in bits, defaulting to 32 when it cannot be determined."""
+    if op.type == "reg":
+        return _REG_BITS.get(str(op.reg).lower(), 32)
+    if op.type == "mem" and op.mem_size:
+        return int(op.mem_size) * 8
+    return 32
+
+
+# Instructions whose CF a later ADC/SBB may consume as a value. NEG was the
+# only one modelled before; the ADD/SUB pair is what 64-bit arithmetic and
+# the CRT rounding helpers actually use. AND/OR/XOR are here because they
+# clear CF, which is just as load-bearing for a consumer as setting it.
+_CARRY_PRODUCERS = frozenset({
+    "neg", "add", "sub", "adc", "sbb", "and", "or", "xor",
+})
+
+
+def _carry_is_consumed(insns, idx):
+    """True when the next flag-consuming instruction is an ADC or SBB.
+
+    Scans forward over EFLAGS-preserving instructions only, so any
+    intervening instruction that redefines CF ends the search.
+    """
+    j = idx + 1
+    while (j < len(insns)
+            and insns[j].mnemonic in _EFLAGS_PRESERVE
+            and insns[j].mnemonic != "popfd"
+            and not insns[j].is_branch
+            and not insns[j].is_call
+            and not insns[j].is_ret):
+        j += 1
+    return j < len(insns) and insns[j].mnemonic in ("sbb", "adc")
+
+
+def _emit_carry_capture(m, ops, dst, src):
+    """Publish CF for an ADD/SUB whose carry a later ADC/SBB consumes.
+
+    Flags are modelled lazily, so an arithmetic instruction normally emits
+    only its result. ADC and SBB are the exception: they read CF as a value
+    (_cf), and until now only NEG ever assigned it. An ADD that carries out
+    of its width therefore fed a stale or zero _cf to the ADC that follows,
+    silently dropping the +1. That is the 64-bit add/subtract idiom and the
+    CRT's _ftol2 rounding fixup, where the dropped carry turns a
+    round-half-away-from-zero into a truncation.
+
+    CF for ADD is the unsigned wrap of the sum; for SUB it is a borrow.
+    """
+    bits = _operand_bits(ops[0])
+    mask = (1 << bits) - 1
+    if m == "add":
+        return [f"_cf = ((uint32_t)(({dst} + {src}) & 0x{mask:X}u)"
+                f" < (uint32_t)({dst} & 0x{mask:X}u)); /* add carry */"]
+    if m == "sub":
+        return [f"_cf = ((uint32_t)({dst} & 0x{mask:X}u)"
+                f" < (uint32_t)({src} & 0x{mask:X}u)); /* sub borrow */"]
+    if m in ("and", "or", "xor"):
+        return [f"_cf = 0; /* {m} clears carry */"]
+    return []
+
+
 # ── Condition code mapping ───────────────────────────────────
 
 # Maps jcc mnemonic → (cmp_macro, test_macro, description)
@@ -543,6 +616,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
     else:
         lhs = None
         rhs = None
+    # _fa is zero-extended, so (int32_t)_fa is never negative for an 8- or
+    # 16-bit result. Sign tests read _fas, the same snapshot sign-extended.
+    slhs = "_fas" if lhs == "_fa" else f"(int32_t){lhs}"
 
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
@@ -671,7 +747,10 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if test_macro:
             return f"{test_macro}({lhs}, {rhs})", desc
         if cmp_macro:
-            return f"{cmp_macro}({lhs} & {rhs}, 0)", desc
+            result = f"({lhs}) & ({rhs})"
+            if cmp_macro in SIGNED and _sf_width in (1, 2):
+                result = f"{_sf_cast}({result})"
+            return f"{cmp_macro}({result}, 0)", desc
         if jcc == "js":
             return f"({_sf_cast}(({lhs}) & ({rhs})) < 0)", desc
         if jcc == "jns":
@@ -716,9 +795,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         # Ordered: reconstruct original a = result + b
         if cmp_macro and rhs:
             return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
@@ -727,13 +806,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({slhs} <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({slhs} > 0)", desc
         return None
 
     # ── add: a = a + b, flags from result ──
@@ -743,21 +822,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc in ("jb", "jnae", "jc"):
             return f"({lhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({slhs} <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({slhs} > 0)", desc
         return None
 
     # ── adc/sbb: result-based (like add/sub but with carry) ──
@@ -767,9 +846,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         return None
 
     # ── and/or/xor: result-based, CF=0, OF=0 ──
@@ -779,13 +858,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc in ("js", "jl"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc in ("jns", "jge"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc == "jle":
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({slhs} <= 0)", desc
         if jcc == "jg":
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({slhs} > 0)", desc
         if jcc in ("jb", "jnae"):
             return "0", desc  # CF=0 after and/or/xor
         if jcc in ("jae", "jnb"):
@@ -843,17 +922,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} == 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({slhs} > 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({slhs} <= 0)", desc
         return None
 
     # ── shift: result-based ──
@@ -863,9 +942,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         return None
 
     # ── shld/shrd: double-precision shift, result-based ──
@@ -875,9 +954,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({slhs} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({slhs} >= 0)", desc
         return None
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
@@ -1201,7 +1280,8 @@ class Lifter:
 
     def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
                  seh_prolog=None, seh_epilog=None,
-                 setjmp_fn=None, longjmp_fn=None, manual_functions=None):
+                 setjmp_fn=None, longjmp_fn=None, manual_functions=None,
+                 manual_call_targets=None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
@@ -1215,11 +1295,14 @@ class Lifter:
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
         self.manual_functions = set(manual_functions or ())
+        self.manual_call_targets = frozenset(manual_call_targets or ())
+        self.manual_call_rewrites = []
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
+        self.current_function_has_ebp = False  # Compatibility with older callers
         self.trace_exit_name = None  # Set per-function when traced
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
@@ -1315,7 +1398,8 @@ class Lifter:
 
         # ── Arithmetic ──
         if m in ("add", "sub", "and", "or", "xor"):
-            return self._lift_alu_binop(insn, ops, m)
+            return self._lift_alu_binop(
+                insn, ops, m, preserve_carry=self.needs_cf)
         if m in ("inc", "dec"):
             return self._lift_inc_dec(insn, ops, m)
         if m == "neg":
@@ -1327,9 +1411,11 @@ class Lifter:
         if m in ("mul", "div", "idiv"):
             return self._lift_muldiv(insn, ops, m)
         if m == "sbb":
-            return self._lift_sbb(insn, ops)
+            return self._lift_sbb(
+                insn, ops, preserve_carry=self.needs_cf)
         if m == "adc":
-            return self._lift_adc(insn, ops)
+            return self._lift_adc(
+                insn, ops, preserve_carry=self.needs_cf)
         if m in ("shl", "sal"):
             return self._lift_shift(insn, ops, "<<")
         if m == "shr":
@@ -1802,7 +1888,7 @@ class Lifter:
         return (f"_fa = (uint32_t)({dst}) & {mask};"
                 f" _fas = (int32_t){sx}(_fa); /* {m} result */")
 
-    def _lift_alu_binop(self, insn, ops, m):
+    def _lift_alu_binop(self, insn, ops, m, preserve_carry=False):
         if len(ops) < 2:
             return [f"/* {m}: bad operands */"]
         c_op = {"add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^"}[m]
@@ -1810,24 +1896,20 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         # XOR reg, reg → zero
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-            out = ["_cf = 0; /* xor clears CF */"] if self.needs_cf else []
-            out.append(_fmt_operand_write(ops[0], "0") + " /* xor self */")
+            out = []
+            if preserve_carry or self.needs_cf:
+                # xor clears CF unconditionally.
+                out.append("_cf = 0; /* xor clears carry */")
+            out.append(
+                _fmt_operand_write(ops[0], "0") + " /* xor self */")
             out.append(self._result_snapshot(ops, m))
             return out
-        expr = f"{dst} {c_op} {src}"
         out = []
         if m in _RESULT_SRC_SETTERS:
             out.append(self._result_snapshot(ops, m, src_too=True))
-        if self.needs_cf:
-            # CF must be computed from the pre-write operands.
-            if m == "add":
-                w = _operand_width(ops[0]) or 4
-                out.append(f"_cf = (int)((((uint64_t)({dst}) + (uint64_t)({src})) >> {w * 8}) & 1);")
-            elif m == "sub":
-                out.append(f"_cf = (int)((uint32_t)({dst}) < (uint32_t)({src}));")
-            else:
-                out.append("_cf = 0; /* logical op clears CF */")
-        out.append(_fmt_operand_write(ops[0], expr))
+        if preserve_carry or self.needs_cf:
+            out.extend(_emit_carry_capture(m, ops, dst, src))
+        out.append(_fmt_operand_write(ops[0], f"{dst} {c_op} {src}"))
         out.append(self._result_snapshot(ops, m))
         return out
 
@@ -1868,7 +1950,7 @@ class Lifter:
         val = _fmt_operand_read(ops[0])
         return [_fmt_operand_write(ops[0], f"~{val}")]
 
-    def _lift_sbb(self, insn, ops):
+    def _lift_sbb(self, insn, ops, preserve_carry=False):
         """SBB: subtract with borrow. Common idiom: sbb reg, reg → -CF (0 or -1)."""
         if len(ops) < 2:
             return ["/* sbb: bad operands */"]
@@ -1876,25 +1958,46 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         # sbb reg, reg is a common idiom: result is 0 or 0xFFFFFFFF depending on CF
         if ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
+            # CF is unchanged in value terms: the borrow out equals the borrow in.
             return [_fmt_operand_write(ops[0], "_cf ? 0xFFFFFFFF : 0")
                     + " /* sbb self (CF extend) */",
                     self._result_snapshot(ops, "sbb")]
-        w = (_operand_width(ops[0]) or 4) * 8
-        return ["{ uint64_t _t = (uint64_t)(%s) - (uint64_t)(%s) - (uint64_t)_cf;"
-                " _cf = (int)((_t >> %d) & 1); %s }  /* sbb */"
-                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
+        if not preserve_carry:
+            return [_fmt_operand_write(ops[0], f"{dst} - {src} - _cf")
+                    + " /* sbb */",
+                    self._result_snapshot(ops, "sbb")]
+        # Chained SBB: the borrow out feeds the next limb. Both it and the
+        # subtraction read the INCOMING borrow, so latch it first - updating
+        # _cf in place would feed the borrow out back into the subtraction.
+        bits = _operand_bits(ops[0])
+        mask = (1 << bits) - 1
+        write = _fmt_operand_write(ops[0], f"{dst} - {src} - _cf_in")
+        return [f"{{ const int _cf_in = _cf;"
+                f" _cf = ((uint64_t)({dst} & 0x{mask:X}u)"
+                f" < (uint64_t)({src} & 0x{mask:X}u) + (uint64_t)_cf_in);"
+                f" {write} }} /* sbb */",
                 self._result_snapshot(ops, "sbb")]
 
-    def _lift_adc(self, insn, ops):
+    def _lift_adc(self, insn, ops, preserve_carry=False):
         """ADC: add with carry."""
         if len(ops) < 2:
             return ["/* adc: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         src = _fmt_operand_read(ops[1])
-        w = (_operand_width(ops[0]) or 4) * 8
-        return ["{ uint64_t _t = (uint64_t)(%s) + (uint64_t)(%s) + (uint64_t)_cf;"
-                " _cf = (int)((_t >> %d) & 1); %s }  /* adc */"
-                % (dst, src, w, _fmt_operand_write(ops[0], "(uint32_t)_t")),
+        if not preserve_carry:
+            return [_fmt_operand_write(ops[0], f"{dst} + {src} + _cf")
+                    + " /* adc */",
+                    self._result_snapshot(ops, "adc")]
+        # Chained ADC: the carry out feeds the next limb. Latch the incoming
+        # carry so the addition does not read the carry it just produced.
+        bits = _operand_bits(ops[0])
+        mask = (1 << bits) - 1
+        write = _fmt_operand_write(ops[0], f"{dst} + {src} + _cf_in")
+        return [f"{{ const int _cf_in = _cf;"
+                f" _cf = (((uint64_t)({dst} & 0x{mask:X}u)"
+                f" + (uint64_t)({src} & 0x{mask:X}u) + (uint64_t)_cf_in)"
+                f" > (uint64_t)0x{mask:X}u);"
+                f" {write} }} /* adc */",
                 self._result_snapshot(ops, "adc")]
 
     def _lift_double_shift(self, insn, ops, m):
@@ -2191,7 +2294,7 @@ class Lifter:
             # function, returned, then called the frameless sub_001DEC07, which
             # inherited a long-dead frame of ~0xA6 and wrote [ebp-0xa2] and
             # [ebp-0xa0] onto Xbox VA 4 and 6: exactly the fs:[4] corruption.
-            if self.publishes_ebp:
+            if self.publishes_ebp or self.current_function_has_ebp:
                 lines.append("g_ebp = ebp; /* frame stays current across calls */")
                 lines.append("g_seh_ebp = ebp;")
             # Non-local jumps have to move the native stack, not just the
@@ -2224,7 +2327,8 @@ class Lifter:
                     "if (!recomp_guest_longjmp(MEM32(esp), MEM32(esp + 4)))"
                     f" {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }}"
                     f" /* longjmp 0x{insn.call_target:08X} */")
-            elif insn.call_target in self.manual_functions:
+            elif (insn.call_target in self.manual_functions or
+                    insn.call_target in self.manual_call_targets):
                 # A function the project replaces by hand. recomp_lookup_manual
                 # is consulted on indirect calls, and without this a direct
                 # caller went straight to the generated body and bypassed the
@@ -2234,6 +2338,9 @@ class Lifter:
                     f"RECOMP_ICALL_SAFE(0x{insn.call_target:08X}u, "
                     "_icall_esp); "
                     f"/* manual call 0x{insn.call_target:08X} */")
+                if insn.call_target in self.manual_call_targets:
+                    self.manual_call_rewrites.append(
+                        (self.func_start, insn.address, insn.call_target))
             else:
                 # Routed through RECOMP_ABI_CALL so -DRECOMP_ABI_CHECK covers
                 # direct calls too. Without it the check sees only indirect
@@ -2380,9 +2487,17 @@ class Lifter:
             if self._is_external_target(insn.jump_target):
                 # Tail call - no return address push (reuses current frame's)
                 # Bridge ebp so the target function can inherit our frame pointer.
-                if insn.jump_target in self.manual_functions:
+                if (insn.jump_target in self.manual_functions or
+                        insn.jump_target in self.manual_call_targets):
+                    if insn.jump_target in self.manual_call_targets:
+                        self.manual_call_rewrites.append(
+                            (self.func_start, insn.address,
+                             insn.jump_target))
+                    publish_frame = (
+                        insn.jump_target in self.manual_functions or
+                        self.publishes_ebp or self.current_function_has_ebp)
                     tail = (
-                        f"g_seh_ebp = ebp; "
+                        ("g_seh_ebp = ebp; " if publish_frame else "") +
                         f"RECOMP_ITAIL(0x{insn.jump_target:08X}u); return; "
                         f"/* manual tail jmp 0x{insn.jump_target:08X} */"
                     )
@@ -3209,7 +3324,6 @@ class Lifter:
             # rejected orthonormal camera matrices at render_cameras.c:458.
             do_pop = " fp_pop();" if m == "fstp" else ""
             if len(ops) >= 1 and ops[0].type == "mem":
-                pop = " fp_pop();" if m == "fstp" else ""
                 if ops[0].mem_size == 4:
                     return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{do_pop} /* {m} */"]
                 elif ops[0].mem_size == 8:
@@ -3624,24 +3738,26 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
-        # NEG sets CF when its operand is nonzero. Preserve that value when
-        # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
-        # instructions (e.g. neg eax; push edi; sbb eax, eax).
-        if curr.mnemonic == "neg":
-            j = i + 1
-            while (j < len(insns)
-                    # popfd is no longer in _EFLAGS_PRESERVE, so the set
-                    # carries this now; it used to need naming here, which is
-                    # how the inconsistency was visible in the first place.
-                    and insns[j].mnemonic in _EFLAGS_PRESERVE
-                    and not insns[j].is_branch
-                    and not insns[j].is_call
-                    and not insns[j].is_ret):
-                j += 1
-            preserve = (j < len(insns)
-                        and insns[j].mnemonic in ("sbb", "adc"))
-            results = lifter._lift_neg(
-                curr, curr.operands, preserve_carry=preserve)
+        # ADC and SBB read CF as a value. Every carry producer that reaches
+        # one must therefore publish it. Only NEG used to do so, which
+        # silently dropped the carry for the far more common producers: the
+        # ADD/ADC and SUB/SBB pair of a 64-bit add or subtract, and the
+        # ADD 0x7FFFFFFF / ADC that implements the CRT's _ftol2 rounding.
+        # Look ahead over EFLAGS-preserving instructions for the consumer.
+        if (curr.mnemonic in _CARRY_PRODUCERS
+                and _carry_is_consumed(insns, i)):
+            if curr.mnemonic == "neg":
+                results = lifter._lift_neg(
+                    curr, curr.operands, preserve_carry=True)
+            elif curr.mnemonic == "sbb":
+                results = lifter._lift_sbb(
+                    curr, curr.operands, preserve_carry=True)
+            elif curr.mnemonic == "adc":
+                results = lifter._lift_adc(
+                    curr, curr.operands, preserve_carry=True)
+            else:
+                results = lifter._lift_alu_binop(
+                    curr, curr.operands, curr.mnemonic, preserve_carry=True)
         else:
             results = lifter.lift_instruction(insns[i])
         stmts.extend(results)

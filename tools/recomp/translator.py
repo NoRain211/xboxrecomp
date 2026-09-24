@@ -308,6 +308,7 @@ def _seh_prologs_of(lifter):
     one = getattr(lifter, "SEH_PROLOG", None)
     return {one} if one is not None else set()
 
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
@@ -323,7 +324,7 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None):
+                 trace_functions=None, manual_call_targets=None):
         """
         xbe_data: bytes - raw XBE file contents
         func_db: dict - addr → function info from functions.json
@@ -342,13 +343,16 @@ class FunctionTranslator:
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
                              setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
-                             seh_epilog=seh_epilog)
+                             seh_epilog=seh_epilog,
+                             manual_call_targets=manual_call_targets)
         self.owned_function_starts = set()
         self.recovered_function_starts = set()
+        self.extended_function_starts = set()
         self.coalesced_function_starts = set()
         self.protected_function_starts = set()
         self._recovered_cfg = {}
         self._ownership_ready = False
+        self.translated_function_starts = set()
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover function entries from bounded static callback tables."""
@@ -481,7 +485,10 @@ class FunctionTranslator:
             reject(
                 f"interior start 0x{protected[0]:08X} is protected by manual code")
         strong = [start for start in actual
-                  if self._is_strong_entry(self.func_db[start], start)]
+                  if self._is_strong_entry(
+                      self.func_db[start], start,
+                      self.STRONG_ENTRY_METHODS,
+                      self.coalesced_function_starts)]
         if strong:
             reject(
                 f"interior start 0x{strong[0]:08X} has independent evidence")
@@ -578,6 +585,7 @@ class FunctionTranslator:
             self._recovered_cfg.pop(start, None)
             self.owned_function_starts.discard(start)
             self.recovered_function_starts.discard(start)
+            self.extended_function_starts.discard(start)
         existing["end"] = end
         existing["size"] = end - target
         existing["num_instructions"] = len(instructions)
@@ -600,67 +608,327 @@ class FunctionTranslator:
             f"({len(instructions)} instructions)",
             file=sys.stderr)
 
-    @staticmethod
-    def _is_multi_byte_nop(instruction):
-        """Return whether one instruction is wide alignment padding.
 
-        An assembler aligns the next branch target with a single wide
-        instruction that has no effect: either an explicit multi-byte ``nop``
-        or the classic ``lea reg, [reg]`` form, which reloads a register with
-        its own address.
+    def adopt_external_functions(self, entries):
+        """Recover function entries supplied with externally analyzed bounds."""
+        for entry in sorted(entries, key=lambda value: value["start"]):
+            target = entry["start"]
+            end = entry["end"]
+            coalesce_starts = entry.get("coalesce_starts")
+            if coalesce_starts is not None:
+                self._coalesce_detected_function(
+                    target, end, coalesce_starts,
+                    entry.get("coalesce_bridges", []))
+                continue
+            if end <= target:
+                continue
+            if target in self.func_db:
+                self._extend_detected_function(target, end)
+                continue
+
+            current_starts = sorted(self.func_db)
+            index = bisect.bisect_right(current_starts, target)
+            if index == 0 or index >= len(current_starts):
+                continue
+            previous = self.func_db[current_starts[index - 1]]
+            if previous.get("end", previous["_addr"]) > target:
+                continue
+            if end > current_starts[index]:
+                continue
+            section = self.func_db[current_starts[index]].get("section", "")
+            if section in (".rdata", ".data"):
+                continue
+
+            raw_bytes = self._read_func_bytes(target, end)
+            if not raw_bytes:
+                continue
+            instructions = self.disasm.disassemble_function(
+                raw_bytes, target, end)
+            if not instructions:
+                continue
+
+            self.func_db[target] = {
+                "_addr": target,
+                "start": f"0x{target:08X}",
+                "end": end,
+                "size": end - target,
+                "name": self.label_db.get(target, f"sub_{target:08X}"),
+                "section": section,
+                "confidence": 0.9,
+                "detection_method": "external_boundary",
+                "num_instructions": len(instructions),
+                "has_prologue": self._func_has_prologue(instructions),
+                "calls_to": [],
+                "called_by": [],
+            }
+            self.recovered_function_starts.add(target)
+
+        return self.recovered_function_starts
+
+    def _coalesce_detected_function(
+            self, target, end, expected_starts, bridge_starts):
+        """Merge an explicitly named set of false interior function starts.
+
+        Some detector seed sets split one real loop at each branch target.
+        Generated cross-fragment back-edges then recurse on the host stack.
+        Coalescence is deliberately explicit and fail-closed: the recovery
+        entry must name every current interior start, none may have independent
+        entry evidence, every fragment must end within the requested extent,
+        and the decoded CFG must tile that extent. Unlike a skipped disjoint
+        recovery, any mismatch rejects the whole recovery batch.
         """
-        if instruction.size < 2:
-            return False
-        if instruction.mnemonic == "nop":
-            return True
-        if instruction.mnemonic != "lea" or len(instruction.operands) != 2:
-            return False
-        destination, source = instruction.operands
-        return (destination.type == "reg" and source.type == "mem"
-                and source.mem_base == destination.reg
-                and not source.mem_index and source.mem_disp == 0)
+        def reject(reason):
+            raise ValueError(
+                f"Invalid recovery coalescence "
+                f"0x{target:08X}->0x{end:08X}: {reason}")
 
-    def _alignment_padding_gaps(self, target, end, instructions):
-        """Return gap starts that hold a wide alignment no-op sequence.
+        if target not in self.func_db:
+            reject("start is not a detected function")
+        if end <= target:
+            reject("end does not follow start")
 
-        A decode gap is only treated as padding when the bytes at the coverage
-        stop must start with a multi-byte no-op, contain only no-ops, and end
-        precisely where the decode picks up again. Real unreached code fails
-        that test, so this cannot invent a body: it only identifies padding
-        the assembler inserted before an already reachable branch target.
-        """
-        covered = {}
+        expected = list(expected_starts)
+        if (not expected or expected != sorted(set(expected))
+                or any(start <= target or start >= end
+                       for start in expected)):
+            reject("coalesce_starts must be sorted unique interior starts")
+        bridges = list(bridge_starts)
+        if (bridges != sorted(set(bridges))
+                or any(start <= target or start >= end
+                       for start in bridges)):
+            reject("coalesce_bridges must be sorted unique interior starts")
+        if any(start in self.func_db for start in bridges):
+            reject("coalesce bridge is already a detected function start")
+
+        actual = sorted(
+            start for start in self.func_db if target < start < end)
+        if actual != expected:
+            formatted = ", ".join(f"0x{start:08X}" for start in actual)
+            reject(f"current interior starts are [{formatted}]")
+        protected = [start for start in actual
+                     if start in self.protected_function_starts]
+        if protected:
+            reject(
+                f"interior start 0x{protected[0]:08X} is protected by manual code")
+        # Seed-derived fragments are not independent evidence. The legacy
+        # authenticated bounds file and the standalone detector both record
+        # strong-entry fields on addresses that are mid-function branch
+        # targets: 0x000985BD is reached only by a conditional jump from
+        # inside 0x00098570, yet the adopted input marks it external_entry.
+        # The seed set is exactly what coalescence is allowed to correct,
+        # so coalesce ignores those fields for such fragments.
+        strong = [
+            start for start in actual
+            if self._is_strong_entry(self.func_db[start], start)
+            and not (
+                self.func_db[start].get("seed_derived")
+                or "seed" in str(
+                    self.func_db[start].get("detection_method", ""))
+            )
+        ]
+        if strong:
+            reject(
+                f"interior start 0x{strong[0]:08X} has independent evidence")
+        overruns = [
+            start for start in actual
+            if self.func_db[start].get("end", start) > end
+        ]
+        if overruns:
+            reject(f"interior function 0x{overruns[0]:08X} crosses end")
+
+        # A bridge exists only to re-enter the decode after an alignment gap
+        # that no direct edge reaches. Prove each one really is that gap:
+        # a single wide no-op padding exactly up to a named false start.
+        # Unchecked, a bridge could name any interior address and make an
+        # otherwise unprovable extent appear to tile.
+        for bridge in bridges:
+            raw_gap = self._read_func_bytes(bridge, end)
+            decoded = (
+                self.disasm.disassemble_function(raw_gap, bridge, end)
+                if raw_gap else None)
+            if not decoded or not self._is_multi_byte_nop(decoded[0]):
+                reject(f"bridge 0x{bridge:08X} is not a multi-byte no-op")
+            if decoded[0].end_address not in expected:
+                reject(
+                    f"bridge 0x{bridge:08X} pads to "
+                    f"0x{decoded[0].end_address:08X}, not a coalesced start")
+
+        # Decode through the gap before the next detected function. A local
+        # jump table may begin exactly at ``end``; its entries are analysis
+        # input, not bytes owned by the coalesced function. The exact tiling
+        # checks below still fail closed if decoded code reaches past ``end``.
+        current_starts = sorted(self.func_db)
+        next_index = bisect.bisect_left(current_starts, end)
+        analysis_end = (
+            current_starts[next_index]
+            if next_index < len(current_starts) else end)
+        recovered = self._recover_cfg(
+            target, analysis_end, set(bridges), set())
+        if recovered is None:
+            reject("could not decode CFG")
+        instructions, jump_tables, _ = recovered
+        # MSVC aligns an interior branch target with a single wide no-op that
+        # no direct edge reaches, so the decode tiles up to the padding and
+        # resumes after it. Close such a gap automatically rather than making
+        # every caller name a bridge: the gap start is the tiler's own
+        # coverage stop, so unlike a caller-supplied bridge it cannot be a
+        # misaligned offset inside a real instruction, and the padding must be
+        # one no-op ending exactly where the decode resumes. The strict tiling
+        # checks below still fail closed on anything this does not cover.
+        padding = self._alignment_padding_gaps(target, end, instructions)
+        if padding:
+            recovered = self._recover_cfg(
+                target, analysis_end, set(bridges) | padding, set())
+            if recovered is None:
+                reject("could not decode CFG")
+            instructions, jump_tables, _ = recovered
+        if not instructions or instructions[0].address != target:
+            reject("CFG does not start at the requested start")
+        covered_end = target
         for instruction in instructions:
-            covered[instruction.address] = instruction.end_address
-        addresses = sorted(covered)
-        resume = set(addresses)
-        gaps = set()
-        cursor = target
-        for address in addresses:
-            if address > cursor:
-                if cursor >= end:
-                    break
-                raw_gap = self._read_func_bytes(cursor, end)
-                decoded = (
-                    self.disasm.disassemble_function(raw_gap, cursor, end)
-                    if raw_gap else None)
-                if decoded and self._is_multi_byte_nop(decoded[0]):
-                    padding_end = cursor
-                    for instruction in decoded:
-                        if (instruction.address != padding_end
-                                or instruction.end_address > address
-                                or (instruction.mnemonic != "nop"
-                                    and not self._is_multi_byte_nop(
-                                        instruction))):
-                            break
-                        padding_end = instruction.end_address
-                        if padding_end == address:
-                            if address in resume:
-                                gaps.add(cursor)
-                            break
-            cursor = max(cursor, covered[address])
-        return gaps
+            if instruction.address != covered_end:
+                reject(f"CFG gap at 0x{covered_end:08X}")
+            if instruction.end_address > end:
+                reject(
+                    f"CFG reaches 0x{instruction.end_address:08X}, "
+                    "past the requested end")
+            covered_end = instruction.end_address
+        if covered_end != end:
+            reject(
+                f"CFG covers through 0x{covered_end:08X}, not the requested "
+                "end")
 
+        existing = self.func_db[target]
+        original_end = existing.get("end", target)
+        for start in actual:
+            del self.func_db[start]
+            self._recovered_cfg.pop(start, None)
+            self.owned_function_starts.discard(start)
+            self.recovered_function_starts.discard(start)
+            self.extended_function_starts.discard(start)
+        existing["end"] = end
+        existing["size"] = end - target
+        existing["num_instructions"] = len(instructions)
+        existing["detection_method"] = "external_coalescence"
+        existing["calls_to"] = sorted({
+            f"0x{instruction.call_target:08X}"
+            for instruction in instructions
+            if instruction.is_call and instruction.call_target is not None
+        })
+        self._recovered_cfg[target] = {
+            "end": end,
+            "instructions": instructions,
+            "jump_tables": jump_tables,
+        }
+        self.coalesced_function_starts.add(target)
+        print(
+            f"Coalesced detected function 0x{target:08X} from "
+            f"0x{original_end:08X} to 0x{end:08X}, removing "
+            f"{len(actual)} false interior starts "
+            f"({len(instructions)} instructions)",
+            file=sys.stderr)
+
+    def _extend_detected_function(self, target, end):
+        """Extend one detected function whose end truncated its real body.
+
+        A computed-jump dispatch can be detected with an end at the first
+        table target, leaving the rest of the body unowned and its interior
+        labels unreachable. An explicit recovery entry that repeats the
+        detected start may push that end outward, but only when the extent
+        is proven: the request must stay inside the gap before the next
+        function, and the decoded CFG must tile the requested extent exactly.
+        An explicit extension names an exact extent, so anything unproven is
+        a bad input rather than a weak inference: it fails the batch closed.
+        Repeating the already detected bounds stays a benign no-op.
+        """
+        existing = self.func_db[target]
+        original_end = existing.get("end", target)
+
+        def reject(reason):
+            raise ValueError(
+                f"Invalid recovery extension 0x{target:08X}->0x{end:08X}: "
+                f"{reason}")
+
+        if end == original_end:
+            return
+        if end < original_end:
+            reject(
+                f"shrinks detected end 0x{original_end:08X}")
+
+        # Compare against current state so an entry adopted earlier in this
+        # same pass still counts as an owner.
+        current_starts = sorted(self.func_db)
+        index = bisect.bisect_right(current_starts, target)
+        if index >= len(current_starts):
+            reject("no following function to bound the extension")
+        next_start = current_starts[index]
+        if end > next_start:
+            reject(
+                f"crosses next function start 0x{next_start:08X}")
+
+        # No other function may already own the newly claimed bytes. An
+        # interior start is caught by the bound above; this catches an
+        # earlier function whose extent reaches into the extension.
+        overlapping = sorted(
+            other for other, info in self.func_db.items()
+            if other != target and other < end
+            and info.get("end", other) > original_end)
+        if overlapping:
+            reject(
+                f"overlaps detected function 0x{overlapping[0]:08X}")
+
+        # Decode across the whole gap before the next function: a dispatch's
+        # jump tables commonly sit just past the last instruction, and they
+        # must be readable to resolve the interior targets. Ownership is
+        # still limited to the requested extent, proven below.
+        recovered = self._recover_cfg(target, next_start, set(), set())
+        if recovered is None:
+            reject("could not decode CFG")
+        instructions, jump_tables, _ = recovered
+        if not instructions:
+            reject("no decoded instructions")
+
+        padding = self._alignment_padding_gaps(target, end, instructions)
+        if padding:
+            recovered = self._recover_cfg(target, next_start, padding, set())
+            if recovered is None:
+                reject("could not decode CFG")
+            instructions, jump_tables, _ = recovered
+
+        # The decoded CFG must tile the requested extent exactly: no gap, no
+        # instruction past the end. That is what proves the requested bytes
+        # are this function's body rather than adjacent data or padding.
+        if instructions[0].address != target:
+            reject("CFG does not start at the requested start")
+        beyond = [insn for insn in instructions if insn.end_address > end]
+        if beyond:
+            reject(
+                f"CFG reaches 0x{max(i.end_address for i in beyond):08X}, "
+                f"past the requested end")
+        covered_end = target
+        for insn in instructions:
+            if insn.address != covered_end:
+                reject(
+                    f"CFG gap at 0x{covered_end:08X}")
+            covered_end = insn.end_address
+        if covered_end != end:
+            reject(
+                f"CFG covers through 0x{covered_end:08X}, not the requested "
+                f"end")
+
+        existing["end"] = end
+        existing["size"] = end - target
+        existing["num_instructions"] = len(instructions)
+        existing["detection_method"] = "external_extension"
+        self._recovered_cfg[target] = {
+            "end": end,
+            "instructions": instructions,
+            "jump_tables": jump_tables,
+        }
+        self.extended_function_starts.add(target)
+        print(f"Extended detected function 0x{target:08X} from "
+              f"0x{original_end:08X} to 0x{end:08X} "
+              f"({len(instructions)} instructions)", file=sys.stderr)
     def _is_alignment_padding_range(self, start, end):
         """Return whether an exact byte range is proven alignment padding."""
         raw = self._read_func_bytes(start, end)
@@ -740,7 +1008,9 @@ class FunctionTranslator:
 
         return targets if targets else None
 
-    def _is_strong_entry(self, func_info, addr=None):
+    @staticmethod
+    def _is_strong_entry(func_info, addr=None, strong_methods=None,
+                         coalesced_starts=None):
         """Return whether an entry has evidence independent of seed recovery."""
         if addr is None:
             addr = func_info.get("_addr")
@@ -748,9 +1018,103 @@ class FunctionTranslator:
             func_info.get("has_prologue")
             or func_info.get("called_by")
             or func_info.get("external_entry")
-            or func_info.get("detection_method") in self.STRONG_ENTRY_METHODS
-            or addr in self.coalesced_function_starts
+            or (strong_methods is not None
+                and func_info.get("detection_method") in strong_methods)
+            or (coalesced_starts is not None and addr in coalesced_starts)
         )
+
+    @staticmethod
+    def _is_multi_byte_nop(instruction):
+        """Return whether one instruction is wide alignment padding.
+
+        An assembler aligns the next branch target with a single wide
+        instruction that has no effect: an explicit multi-byte ``nop``, the
+        classic ``lea reg, [reg]`` form, which reloads a register with its
+        own address, or a register self-move such as MSVC's two-byte
+        ``mov edi, edi``. These forms all appear in this XBE.
+        """
+        if instruction.size < 2:
+            return False
+        if instruction.mnemonic == "nop":
+            return True
+        if instruction.mnemonic == "mov" and len(instruction.operands) == 2:
+            destination, source = instruction.operands
+            return (destination.type == "reg" and source.type == "reg"
+                    and destination.reg == source.reg)
+        if instruction.mnemonic != "lea" or len(instruction.operands) != 2:
+            return False
+        destination, source = instruction.operands
+        return (destination.type == "reg" and source.type == "mem"
+                and source.mem_base == destination.reg
+                and not source.mem_index and source.mem_disp == 0)
+
+    def _alignment_padding_gaps(self, target, end, instructions):
+        """Return gap starts that hold a wide alignment no-op sequence.
+
+        A decode gap is only treated as padding when the bytes at the coverage
+        stop must start with a multi-byte no-op, contain only no-ops, and end
+        precisely where the decode picks up again. Real unreached code fails
+        that test, so this cannot invent a body: it only identifies padding
+        the assembler inserted before an already reachable branch target.
+        """
+        covered = {}
+        for instruction in instructions:
+            covered[instruction.address] = instruction.end_address
+        addresses = sorted(covered)
+        resume = set(addresses)
+        gaps = set()
+        cursor = target
+        for address in addresses:
+            if address > cursor:
+                if cursor >= end:
+                    break
+                raw_gap = self._read_func_bytes(cursor, end)
+                decoded = (
+                    self.disasm.disassemble_function(raw_gap, cursor, end)
+                    if raw_gap else None)
+                if decoded and self._is_multi_byte_nop(decoded[0]):
+                    padding_end = cursor
+                    for instruction in decoded:
+                        if (instruction.address != padding_end
+                                or instruction.end_address > address
+                                or (instruction.mnemonic != "nop"
+                                    and not self._is_multi_byte_nop(
+                                        instruction))):
+                            break
+                        padding_end = instruction.end_address
+                        if padding_end == address:
+                            if address in resume:
+                                gaps.add(cursor)
+                            break
+            cursor = max(cursor, covered[address])
+        return gaps
+
+    def recover_external_cfgs(self):
+        """Recover CFGs whose authenticated input records an exact count."""
+        for start, info in sorted(self.func_db.items()):
+            expected = info.get("external_cfg_instruction_count")
+            if expected is None:
+                continue
+            end = info.get("end", start)
+            recovered = self._recover_cfg(start, end, set(), set())
+            actual = 0 if recovered is None else len(recovered[0])
+            if recovered is None or actual != expected:
+                raise ValueError(
+                    f"External CFG 0x{start:08X}->0x{end:08X} has "
+                    f"{actual} instructions, expected {expected}")
+            if actual == 0:
+                # An entry that authenticates an empty body would install a
+                # CFG that owns bytes it never decoded, so refuse the record
+                # rather than let a zero count agree with itself.
+                raise ValueError(
+                    f"External CFG 0x{start:08X}->0x{end:08X} decoded no "
+                    "instructions")
+            instructions, jump_tables, _ = recovered
+            self._recovered_cfg[start] = {
+                "end": end,
+                "instructions": instructions,
+                "jump_tables": jump_tables,
+            }
 
     def discover_cfg_ownership(self):
         """Reassign weak seeds reached through a split computed-jump CFG."""
@@ -762,7 +1126,9 @@ class FunctionTranslator:
         weak_by_section = {}
         for addr, info in self.func_db.items():
             section = info.get("section", "")
-            if self._is_strong_entry(info, addr):
+            if self._is_strong_entry(
+                    info, addr, self.STRONG_ENTRY_METHODS,
+                    self.coalesced_function_starts):
                 by_section.setdefault(section, []).append(addr)
             else:
                 weak_by_section.setdefault(section, []).append(addr)
@@ -1722,6 +2088,7 @@ class FunctionTranslator:
                 f"Unsupported interrupt return {interrupt_return.mnemonic} at "
                 f"0x{interrupt_return.address:08X}: guest EIP/CS/EFLAGS restore "
                 "is not implemented")
+        self.translated_function_starts.add(start)
 
         # Get classification and ABI info
         cls_info = self.classification_db.get(start, {})
@@ -2188,11 +2555,14 @@ class BatchTranslator:
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
-                 trace_functions=None, coalesce_json_paths=None,
-                 protected_function_starts=None):
+                 trace_functions=None, recovery_json_path=None,
+                 manual_call_targets=None, manual_call_targets_sha256=None,
+                 coalesce_json_paths=None, protected_function_starts=None):
         self.xbe_path = xbe_path
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
+        self.manual_call_targets = frozenset(manual_call_targets or ())
+        self.manual_call_targets_sha256 = manual_call_targets_sha256
 
         # Load XBE
         with open(xbe_path, "rb") as f:
@@ -2210,6 +2580,20 @@ class BatchTranslator:
             func["_addr"] = addr
             if "end" in func:
                 func["end"] = int(func["end"], 16)
+            # The legacy authenticated bounds file records "external_entry":
+            # true on every entry, including mid-function branch targets the
+            # runtime has proven are not real entries (0x985BD is reached
+            # only by a conditional jump from inside 0x98570). Treat that
+            # field as absent for such bounds, which coalescence is
+            # explicitly allowed to correct.
+            if func.get("detection_method") == "authenticated_prior_bounds":
+                func["external_entry"] = False
+                func["seed_derived"] = True
+            if "seed" in str(func.get("detection_method", "")):
+                func["seed_derived"] = True
+                func["external_entry"] = False
+                func["has_prologue"] = bool(func.get("has_prologue")) and False
+                func["called_by"] = []
             self.func_db[addr] = func
 
         # Load labels
@@ -2239,19 +2623,62 @@ class BatchTranslator:
                 addr = int(entry["address"], 16)
                 self.abi_db[addr] = entry
 
-        # Recover boundaries before identifying helpers from complete bodies.
+        seh_prolog_override, seh_epilog_override = seh_prolog, seh_epilog
+
+        # Recover boundaries before identifying runtime helpers. The private
+        # integration path has additional authenticated/external CFG inputs and
+        # manual-call rewriting, so construct the translator once with helper
+        # addresses disabled, run every recovery source, then detect helpers
+        # from the final repaired bodies.
         self.translator = FunctionTranslator(
             self.xbe_data, self.func_db, self.label_db,
             self.classification_db, self.abi_db,
             seh_prolog=0, seh_epilog=0,
-            trace_functions=trace_functions)
+            setjmp_fn=None, longjmp_fn=None,
+            trace_functions=trace_functions,
+            manual_call_targets=self.manual_call_targets)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
-        for explicit_helper in (seh_prolog, seh_epilog):
+        for explicit_helper in (seh_prolog_override, seh_epilog_override):
             if explicit_helper not in (None, 0):
                 self.translator.protected_function_starts.add(explicit_helper)
+
+        self.translator.recover_external_cfgs()
+        self.translator.discover_static_indirect_targets(
+            coalescing=bool(coalesce_json_paths))
+        if recovery_json_path:
+            recovery_json_paths = (
+                [recovery_json_path]
+                if isinstance(recovery_json_path, (str, os.PathLike))
+                else recovery_json_path)
+            entries = []
+            for path in recovery_json_paths:
+                with open(path, "r") as recovery_file:
+                    recovery_list = json.load(recovery_file)
+                for entry in recovery_list:
+                    parsed = {
+                        "start": int(entry["start"], 16),
+                        "end": int(entry["end"], 16),
+                    }
+                    if "coalesce_starts" in entry:
+                        parsed["coalesce_starts"] = [
+                            int(start, 16)
+                            for start in entry["coalesce_starts"]
+                        ]
+                    if "coalesce_bridges" in entry:
+                        parsed["coalesce_bridges"] = [
+                            int(start, 16)
+                            for start in entry["coalesce_bridges"]
+                        ]
+                    entries.append(parsed)
+            before = len(self.translator.recovered_function_starts)
+            self.translator.adopt_external_functions(entries)
+            adopted = len(self.translator.recovered_function_starts) - before
+            print(
+                f"Adopted {adopted} of {len(entries)} externally analyzed "
+                f"function bounds from {len(recovery_json_paths)} file(s)",
+                file=sys.stderr)
         if coalesce_json_paths:
-            self.translator.discover_static_indirect_targets(coalescing=True)
             for path in coalesce_json_paths:
                 for entry in load_coalescences(path):
                     self.translator.coalesce_function(
@@ -2263,14 +2690,14 @@ class BatchTranslator:
             addr: info for addr, info in self.func_db.items()
             if info.get("detection_method") != "static_indirect_table"
         }
-
         # Detect once here so the result can be reported and overridden from
         # the command line without retaining an address of a removed fragment.
-        if seh_prolog is None or seh_epilog is None:
-            found_prologs, found_epilog = detect_seh_helpers(
-                helper_func_db, self.xbe_data, verbose=True)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prologs
-            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
+        found_prologs, found_epilog = detect_seh_helpers(
+            helper_func_db, self.xbe_data, verbose=True)
+        seh_prolog = (seh_prolog_override
+                      if seh_prolog_override is not None else found_prologs)
+        seh_epilog = (seh_epilog_override
+                      if seh_epilog_override is not None else found_epilog)
         seh_prologs = tuple(sorted(_as_addr_set(seh_prolog)))
         self.seh_prolog = (None if not seh_prologs else
                            seh_prologs[0] if len(seh_prologs) == 1 else
@@ -2288,9 +2715,104 @@ class BatchTranslator:
             {seh_epilog} if seh_epilog is not None else set())
         self.translator.lifter.SETJMP_FN = setjmp_fn
         self.translator.lifter.LONGJMP_FN = longjmp_fn
-        if not coalesce_json_paths:
-            self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
+        unknown_targets = self.manual_call_targets.difference(self.func_db)
+        if unknown_targets:
+            formatted = ", ".join(
+                f"0x{target:08X}" for target in sorted(unknown_targets))
+            raise ValueError(f"Unknown manual-call targets: {formatted}")
+        owned_targets = self.manual_call_targets.intersection(
+            self.translator.owned_function_starts)
+        if owned_targets:
+            formatted = ", ".join(
+                f"0x{target:08X}" for target in sorted(owned_targets))
+            raise ValueError(
+                f"Manual-call targets are internal CFG blocks: {formatted}")
+
+    def _expected_manual_call_sites(self, function_starts):
+        """Census selected direct calls in the functions being translated."""
+        expected = set()
+        for start in sorted(function_starts):
+            func_info = self.func_db.get(start)
+            if not func_info:
+                continue
+            recovered = self.translator._recovered_cfg.get(start)
+            end = recovered["end"] if recovered else func_info.get("end")
+            if not end:
+                end = start + func_info.get("size", 0)
+            if end <= start:
+                continue
+            if recovered:
+                instructions = recovered["instructions"]
+            else:
+                raw_bytes = self.translator._read_func_bytes(start, end)
+                if not raw_bytes:
+                    continue
+                instructions = self.translator.disasm.disassemble_function(
+                    raw_bytes, start, end)
+            for insn in instructions or ():
+                target = getattr(insn, "call_target", None)
+                if target is None and getattr(insn, "mnemonic", None) == "jmp":
+                    target = getattr(insn, "jump_target", None)
+                if target in self.manual_call_targets:
+                    expected.add((start, insn.address, target))
+        return expected
+
+    def _manual_call_rewrite_receipts(self, function_starts=None):
+        rewrites = sorted(set(self.translator.lifter.manual_call_rewrites))
+        if function_starts is None:
+            function_starts = self.translator.translated_function_starts
+        expected = self._expected_manual_call_sites(function_starts)
+        observed = set(rewrites)
+        missing = expected.difference(observed)
+        unexpected = observed.difference(expected)
+        if missing or unexpected:
+            def fmt(sites):
+                return ", ".join(
+                    f"caller=0x{caller:08X} callsite=0x{callsite:08X} "
+                    f"target=0x{target:08X}"
+                    for caller, callsite, target in sorted(sites))
+
+            detail = []
+            if missing:
+                detail.append(f"not rewritten: {fmt(missing)}")
+            if unexpected:
+                detail.append(f"unexpected rewrites: {fmt(unexpected)}")
+            raise RuntimeError(
+                "Manual-call rewrite census mismatch "
+                f"(expected {len(expected)}, emitted {len(observed)}); "
+                + "; ".join(detail))
+
+        receipts = []
+        for caller, callsite, target in rewrites:
+            receipt = {
+                "caller": f"0x{caller:08X}",
+                "callsite": f"0x{callsite:08X}",
+                "target": f"0x{target:08X}",
+            }
+            receipts.append(receipt)
+            print(
+                "Manual call rewrite: "
+                f"caller={receipt['caller']} "
+                f"callsite={receipt['callsite']} "
+                f"target={receipt['target']}",
+                file=sys.stderr)
+        print(
+            f"Manual call census: {len(receipts)} rewrites match "
+            f"{len(expected)} expected selected callsites",
+            file=sys.stderr)
+        return receipts
+
+    def _record_manual_call_stats(self, stats):
+        manual_call_targets = getattr(
+            self, "manual_call_targets", frozenset())
+        stats["manual_call_targets"] = [
+            f"0x{target:08X}" for target in sorted(manual_call_targets)]
+        stats["manual_call_targets_sha256"] = (
+            getattr(self, "manual_call_targets_sha256", None))
+        stats["manual_call_rewrites"] = (
+            self._manual_call_rewrite_receipts()
+            if manual_call_targets else [])
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
         """
@@ -2323,7 +2845,9 @@ class BatchTranslator:
         func_info = self.func_db.get(addr)
         if not func_info:
             return None
-        return self.translator.translate_function(addr, func_info)
+        code = self.translator.translate_function(addr, func_info)
+        self._manual_call_rewrite_receipts(function_starts={addr})
+        return code
 
     def translate_batch(self, func_list, output_file=None, max_funcs=None,
                         verbose=False):
@@ -2396,6 +2920,8 @@ class BatchTranslator:
                 c_chunks.append(f"void {name}(void) {{ /* translation failed */ }}")
                 c_chunks.append("")
                 stats["failed"] += 1
+
+        self._record_manual_call_stats(stats)
 
         # Write output
         if output_file is None:
@@ -2503,6 +3029,8 @@ class BatchTranslator:
                 stub += f"void {name}(void) {{ /* translation failed */ }}\n"
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
+
+        self._record_manual_call_stats(stats)
 
         # Any address called but never defined needs a stub, or the link fails.
         # These are almost all mid-function entry points the function detector

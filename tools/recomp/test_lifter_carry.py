@@ -97,8 +97,7 @@ class CarryLifterTest(unittest.TestCase):
         generated = "\n".join(lifted)
 
         self.assertIn("_cf = (int)((eax) != 0);", generated)
-        self.assertIn("+ (uint64_t)_cf;", generated)
-        self.assertIn("edx = (uint32_t)_t;", generated)
+        self.assertIn("edx = edx + 0 + _cf; /* adc */", generated)
 
     def test_neg_carry_feeds_sbb_across_push(self):
         neg = Instruction(0, 2, "neg", "eax", "f7d8")
@@ -174,7 +173,6 @@ class CarryLifterTest(unittest.TestCase):
 
         self.assertNotIn("_cf = (int)((eax) != 0);", generated)
 
-
 if __name__ == "__main__":
     unittest.main()
 
@@ -205,7 +203,8 @@ class CarryBranchTest(unittest.TestCase):
 
     def test_add_publishes_carry(self):
         self.assertIn(
-            "_cf = (int)((((uint64_t)(edx) + (uint64_t)(edx)) >> 32) & 1);",
+            "_cf = ((uint32_t)((edx + edx) & 0xFFFFFFFFu)"
+            " < (uint32_t)(edx & 0xFFFFFFFFu)); /* add carry */",
             self._add_then("jae"),
         )
 
@@ -259,4 +258,3 @@ class NeedsCarryTest(unittest.TestCase):
     def test_adc_alone_needs_cf(self):
         self.assertTrue(FunctionTranslator._function_needs_cf(
             [self._insn("adc")]))
-

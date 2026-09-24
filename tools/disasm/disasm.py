@@ -144,6 +144,12 @@ class Disassembler:
         if self.verbose:
             print(f"  Resynced past {n_tables:,d} embedded jump table(s)")
 
+        if self.seed_functions:
+            n = self.engine.decode_entry_streams(self.seed_functions, sections)
+            total_insns += n
+            if self.verbose:
+                print(f"  Seed entry streams: {n:,d} extra instructions")
+
         # Phase 4: Cross-references
         if self.verbose:
             print("\nPhase 4: Building cross-references...")

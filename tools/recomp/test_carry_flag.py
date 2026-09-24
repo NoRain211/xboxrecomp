@@ -68,9 +68,10 @@ def test_shr_produces_shifted_out_bit():
 
 def test_adc_consumes_and_reproduces_carry():
     out = _lift("adc", [EDX, ECX])
-    assert "_cf" in out, out
-    # Carry-out for the next word in the chain.
-    assert "_cf = (int)((_t >>" in out, out
+    assert "const int _cf_in = _cf" in out, out
+    # Carry-out is published before the result consumes the latched input.
+    assert out.index("_cf =") < out.index("edx ="), out
+    assert "edx + ecx + _cf_in" in out, out
 
 
 def test_logical_ops_clear_carry():

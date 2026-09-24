@@ -19,14 +19,53 @@ Options:
 """
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import sys
 import time
 
 from . import config
 from .translator import BatchTranslator
 from .output import write_summary, print_stats, generate_header
+
+
+def load_manual_call_targets(path, expected_sha256):
+    """Load a checked list of direct-call targets that use manual dispatch."""
+    if bool(path) != bool(expected_sha256):
+        raise ValueError(
+            "--manual-call-targets and --manual-call-targets-sha256 "
+            "must be supplied together")
+    if not path:
+        return frozenset(), None
+    if not re.fullmatch(r"[0-9A-Fa-f]{64}", expected_sha256):
+        raise ValueError("Manual-call target SHA-256 must be 64 hex digits")
+
+    with open(path, "rb") as target_file:
+        payload = target_file.read()
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256 != expected_sha256.lower():
+        raise ValueError(
+            "Manual-call target file does not match its authenticated SHA-256")
+
+    try:
+        entries = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid manual-call target JSON: {error}") from error
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Manual-call target JSON must be a non-empty array")
+
+    targets = []
+    for entry in entries:
+        if not isinstance(entry, str) or not re.fullmatch(
+                r"0x[0-9A-Fa-f]{8}", entry):
+            raise ValueError(
+                "Manual-call targets must be canonical 0xXXXXXXXX strings")
+        targets.append(int(entry, 16))
+    if len(set(targets)) != len(targets):
+        raise ValueError("Manual-call target JSON contains duplicates")
+    return frozenset(targets), actual_sha256
 
 
 def find_data_files(disasm_dir=None, func_id_dir=None, abi_dir=None, overrides=None):
@@ -226,6 +265,14 @@ def main():
                         help="JSON list of addresses to emit an entry trace "
                              "for (RECOMP_TRACE_ENTER). For bring-up: shows "
                              "which call in an init chain is not returning")
+    parser.add_argument("--recover-functions", metavar="JSON", action="append",
+                        help="JSON file of externally analyzed function bounds "
+                             "to adopt. May be repeated to layer recovery sets.")
+    parser.add_argument("--manual-call-targets",
+                        help="Authenticated JSON array of direct-call targets "
+                             "that must dispatch through manual lookup")
+    parser.add_argument("--manual-call-targets-sha256",
+                        help="Expected SHA-256 of --manual-call-targets")
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
@@ -235,6 +282,14 @@ def main():
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
     args = parser.parse_args()
+
+    try:
+        manual_call_targets, manual_call_targets_sha256 = (
+            load_manual_call_targets(
+                args.manual_call_targets,
+                args.manual_call_targets_sha256))
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
     # Boundary repair is destructive: an interior function start disappears
     # once it is coalesced into its owner. Load hand-written entry points before
@@ -296,6 +351,9 @@ def main():
         protected_function_starts=protected_function_starts,
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
+        recovery_json_path=args.recover_functions,
+        manual_call_targets=manual_call_targets,
+        manual_call_targets_sha256=manual_call_targets_sha256,
     )
 
     t_load = time.time() - t0
