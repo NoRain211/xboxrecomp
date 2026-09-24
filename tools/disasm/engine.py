@@ -208,6 +208,62 @@ class DisasmEngine:
 
         return count
 
+    def decode_entry_streams(self, start_addresses: List[int],
+                             sections: List[SectionInfo]) -> int:
+        """
+        Decode explicit entry streams that linear sweep can miss.
+
+        x86 permits valid control-flow targets in byte positions that the
+        initial linear sweep decoded as part of a different instruction stream.
+        Seeded function starts come from later evidence, so decode a short
+        stream from each seed before function detection.
+        """
+        section_ranges = [
+            (sec.virtual_addr, sec.virtual_addr + sec.raw_size, sec)
+            for sec in sections
+            if sec.raw_size > 0
+        ]
+        decoded = 0
+
+        for start in start_addresses:
+            if start in self.instructions:
+                continue
+
+            matched = None
+            for range_start, range_end, sec in section_ranges:
+                if range_start <= start < range_end:
+                    matched = (range_start, range_end, sec)
+                    break
+            if matched is None:
+                continue
+
+            _, range_end, sec = matched
+            offset = start - sec.virtual_addr
+            data = self.image.get_section_data(sec)
+            if offset < 0 or offset >= len(data):
+                continue
+
+            chunk = data[offset:]
+            current = start
+            for cs_insn in self._cs.disasm(chunk, start):
+                if cs_insn.address != current:
+                    break
+                if cs_insn.address >= range_end:
+                    break
+
+                insn = self._classify_instruction(cs_insn)
+                if insn.address not in self.instructions:
+                    decoded += 1
+                self.instructions[insn.address] = insn
+
+                current = insn.end_address
+                if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
+                    break
+
+        if decoded:
+            self._sorted_addrs = None
+        return decoded
+
     def recursive_descent(self, start_addresses: List[int],
                           section_bounds: List[Tuple[int, int]]) -> Set[int]:
         """

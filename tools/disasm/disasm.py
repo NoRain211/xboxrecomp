@@ -138,6 +138,12 @@ class Disassembler:
         if self.verbose:
             print(f"  Total: {total_insns:,d} instructions")
 
+        if self.seed_functions:
+            n = self.engine.decode_entry_streams(self.seed_functions, sections)
+            total_insns += n
+            if self.verbose:
+                print(f"  Seed entry streams: {n:,d} extra instructions")
+
         # Phase 4: Cross-references
         if self.verbose:
             print("\nPhase 4: Building cross-references...")

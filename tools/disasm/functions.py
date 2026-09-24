@@ -106,7 +106,10 @@ class FunctionDetector:
         # Pass 4: Call targets
         self._pass_call_targets(sections)
 
-        # Pass 5: Build functions from candidates
+        # Pass 5: Code addresses stored as immediates
+        self._pass_code_pointers(sections)
+
+        # Pass 6: Build functions from candidates
         self._build_functions(sections)
 
         # Populate call graph
@@ -237,6 +240,41 @@ class FunctionDetector:
                         config.CONFIDENCE_CALL_TARGET,
                         "call_target"
                     )
+
+    def _pass_code_pointers(self, sections: List[SectionInfo]) -> None:
+        """
+        Pass 5: Add code addresses stored as immediates as function starts.
+
+        A callback registered in a pointer table - 'mov [table+i*4], offset f'
+        - is never the destination of a direct CALL, so pass 4 cannot see it.
+        When such a function also lacks a push ebp/mov ebp,esp prologue and
+        has no CC padding in front of it, no pass sees it at all and it is
+        emitted as a fail-loud stub that stops the program when the guest
+        finally calls through the table.
+
+        Only immediates that land on an instruction boundary in an executable
+        section are accepted. A pointer into .data, or into the middle of an
+        instruction, is an integer constant that happens to look like an
+        address, and inventing a function there would be worse than missing
+        one.
+        """
+        for insn in self.engine.instructions.values():
+            target = insn.imm_ref
+            if target is None or target in self._candidates:
+                continue
+            if target not in self.engine.instructions:
+                continue
+            section = self.image.get_section_at_va(target)
+            if section is None or not section.executable:
+                continue
+            # The address the pointer is stored at is data, not code; only the
+            # immediate is a candidate. Storing instructions are not calls, so
+            # imm_ref is already the value rather than a branch destination.
+            self._add_candidate(
+                target,
+                config.CONFIDENCE_CODE_POINTER,
+                "code_pointer"
+            )
 
     def _build_functions(self, sections: List[SectionInfo]) -> None:
         """
