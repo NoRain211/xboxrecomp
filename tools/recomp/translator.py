@@ -128,6 +128,7 @@ class FunctionTranslator:
         self.recovered_function_starts = set()
         self.extended_function_starts = set()
         self.coalesced_function_starts = set()
+        self.jump_table_entry_starts = set()
         self._recovered_cfg = {}
         self._ownership_ready = False
         self.translated_function_starts = set()
@@ -744,6 +745,97 @@ class FunctionTranslator:
                     "instructions": instructions,
                     "jump_tables": jump_tables,
                 }
+
+    def discover_jump_table_entries(self):
+        """Give a callable entry to each switch arm the lifter cannot inline.
+
+        A function list can cut one function at its own switch, so some arms
+        land past the dispatching entry's end. The lifter then emits the
+        indexed jump as an indirect tail call and the runtime dispatches the
+        selected arm by address. An arm at a known function start resolves;
+        any other arm has no generated body. Register those arms as entries
+        that run to the next known start, the way a split function continues
+        into its next piece. Existing bodies are unchanged.
+
+        Run after discover_cfg_ownership, which settles translated bounds.
+        """
+        arms = {}
+        for start, info in self.func_db.items():
+            if start in self.owned_function_starts:
+                continue
+            recovered = self._recovered_cfg.get(start)
+            if recovered:
+                end = recovered["end"]
+                instructions = recovered["instructions"]
+            else:
+                end = info.get("end", start)
+                raw_bytes = self._read_func_bytes(start, end)
+                instructions = (
+                    self.disasm.disassemble_function(raw_bytes, start, end)
+                    if raw_bytes else [])
+            for insn in instructions:
+                if (insn.mnemonic != "jmp" or insn.jump_target
+                        or not insn.operands
+                        or insn.operands[0].type != "mem"):
+                    continue
+                operand = insn.operands[0]
+                if not operand.mem_index or operand.mem_base:
+                    continue
+                # MSVC places a switch table after the code it indexes.
+                targets = self._read_local_jump_table(
+                    operand.mem_disp, start, operand.mem_disp)
+                if all(start <= target < end for target in targets):
+                    continue  # lifted as in-function gotos
+                for target in targets:
+                    if target not in self.func_db:
+                        arms.setdefault(target, set()).add(start)
+
+        # Highest first, so a lower arm ends at an accepted higher one and
+        # bridges into it rather than past it.
+        starts = sorted(self.func_db)
+        for target in sorted(arms, reverse=True):
+            index = bisect.bisect_right(starts, target)
+            if index == 0:
+                continue
+            enclosing_start = starts[index - 1]
+            enclosing = self.func_db[enclosing_start]
+            enclosing_end = enclosing.get("end", enclosing_start)
+            end = starts[index] if index < len(starts) else enclosing_end
+            if target < enclosing_end:
+                end = min(end, enclosing_end)
+            if end <= target:
+                continue
+            raw_bytes = self._read_func_bytes(target, end)
+            if not raw_bytes:
+                continue
+            instructions = self.disasm.disassemble_function(
+                raw_bytes, target, end)
+            if not instructions:
+                continue
+            # Reject a body that neither leaves nor continues into an entry.
+            if not (any(insn.is_terminator for insn in instructions)
+                    or (instructions[-1].end_address == end
+                        and end in self.func_db)):
+                continue
+
+            self.func_db[target] = {
+                "_addr": target,
+                "start": f"0x{target:08X}",
+                "end": end,
+                "size": end - target,
+                "name": self.label_db.get(target, f"sub_{target:08X}"),
+                "section": enclosing.get("section", ""),
+                "confidence": 0.9,
+                "detection_method": "jump_table_arm",
+                "num_instructions": len(instructions),
+                "has_prologue": False,
+                "calls_to": [],
+                "called_by": sorted(arms[target]),
+            }
+            bisect.insort(starts, target)
+            self.jump_table_entry_starts.add(target)
+
+        return self.jump_table_entry_starts
 
     def _recover_cfg(self, start, upper, bridge_targets, stop_addresses):
         """Decode direct CFG edges and local indexed-table destinations."""
@@ -1373,6 +1465,10 @@ class BatchTranslator:
                   f"function bounds from {len(recovery_json_paths)} file(s)",
                   file=sys.stderr)
         self.translator.discover_cfg_ownership()
+        arms = self.translator.discover_jump_table_entries()
+        if arms:
+            print(f"Recovered {len(arms)} jump-table arm entries",
+                  file=sys.stderr)
         unknown_targets = self.manual_call_targets.difference(self.func_db)
         if unknown_targets:
             formatted = ", ".join(
