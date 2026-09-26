@@ -810,10 +810,11 @@ class FunctionTranslator:
                 continue  # runs off its range; not a whole arm
             if any(insn.is_branch and insn.jump_target is not None
                    and not target <= insn.jump_target < end
-                   and insn.jump_target not in self.func_db
+                   and (insn.jump_target not in self.func_db
+                        or insn.jump_target in self.owned_function_starts)
                    for insn in instructions):
-                # A branch back into its function would become a call to an
-                # empty stub; an unresolved dispatch at least stops loudly.
+                # A branch to code with no generated body would become a call
+                # to an empty stub; an unresolved dispatch at least stops.
                 continue
             enclosing = self.func_db[max(
                 start for start in callers)]
