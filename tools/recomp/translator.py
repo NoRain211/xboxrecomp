@@ -808,6 +808,13 @@ class FunctionTranslator:
             end = max(insn.end_address for insn in instructions)
             if not any(insn.is_terminator for insn in instructions):
                 continue  # runs off its range; not a whole arm
+            if any(insn.is_branch and insn.jump_target is not None
+                   and not target <= insn.jump_target < end
+                   and insn.jump_target not in self.func_db
+                   for insn in instructions):
+                # A branch back into its function would become a call to an
+                # empty stub; an unresolved dispatch at least stops loudly.
+                continue
             enclosing = self.func_db[max(
                 start for start in callers)]
             self.func_db[target] = {
