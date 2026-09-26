@@ -60,16 +60,24 @@ class JumpTableArmEntryTest(unittest.TestCase):
         translator = self.translator({TEXT: entry(TEXT, TABLE)})
         self.assertEqual(translator.discover_jump_table_entries(), set())
 
-    def test_arm_branching_back_to_a_non_entry_is_left_unresolved(self):
-        translator = self.translator({
-            TEXT: entry(TEXT, SPLIT),
-            SPLIT: entry(SPLIT, PIECE),
-            PIECE: entry(PIECE, TABLE),
-        })
-        image = bytearray(translator.xbe_data)
-        put(image, ARM, bytes.fromhex("ebf6"))  # jmp ARM - 8
-        translator.xbe_data = bytes(image)
-        self.assertEqual(translator.discover_jump_table_entries(), set())
+    def test_arm_that_cannot_run_alone_is_left_unresolved(self):
+        # A new entry for any of these would misbehave silently.
+        for name, code in (
+                ("branches back to a non-entry", "ebf6"),     # jmp ARM - 8
+                ("runs off its range", "eb07"),               # jmp to int3s
+                ("reads the dispatcher's flags", "83d000c3"),  # adc eax, 0
+                ("calls a missing body", "e84b000000c3")):    # call TEXT+0x80
+            with self.subTest(name):
+                translator = self.translator({
+                    TEXT: entry(TEXT, SPLIT),
+                    SPLIT: entry(SPLIT, PIECE),
+                    PIECE: entry(PIECE, TABLE),
+                })
+                image = bytearray(translator.xbe_data)
+                put(image, ARM, bytes.fromhex(code))
+                translator.xbe_data = bytes(image)
+                self.assertEqual(
+                    translator.discover_jump_table_entries(), set())
 
 
 if __name__ == "__main__":
