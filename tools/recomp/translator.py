@@ -753,13 +753,13 @@ class FunctionTranslator:
         land past the dispatching entry's end. The lifter then emits the
         indexed jump as an indirect tail call and the runtime dispatches the
         selected arm by address. An arm at a known function start resolves;
-        any other arm has no generated body. Register those arms as entries
-        that run to the next known start, the way a split function continues
-        into its next piece. Existing bodies are unchanged.
+        any other arm has no generated body. Recover each such arm's
+        reachable code, up to its table, as a function of its own. Existing
+        bodies are unchanged.
 
         Run after discover_cfg_ownership, which settles translated bounds.
         """
-        arms = {}
+        sites = []
         for start, info in self.func_db.items():
             if start in self.owned_function_starts:
                 continue
@@ -779,45 +779,37 @@ class FunctionTranslator:
                         or insn.operands[0].type != "mem"):
                     continue
                 operand = insn.operands[0]
-                if not operand.mem_index or operand.mem_base:
-                    continue
-                # MSVC places a switch table after the code it indexes.
-                targets = self._read_local_jump_table(
-                    operand.mem_disp, start, operand.mem_disp)
-                if all(start <= target < end for target in targets):
-                    continue  # lifted as in-function gotos
-                for target in targets:
-                    if target not in self.func_db:
-                        arms.setdefault(target, set()).add(start)
+                if operand.mem_index and not operand.mem_base:
+                    sites.append((start, end, operand.mem_disp))
 
-        # Highest first, so a lower arm ends at an accepted higher one and
-        # bridges into it rather than past it.
-        starts = sorted(self.func_db)
-        for target in sorted(arms, reverse=True):
-            index = bisect.bisect_right(starts, target)
-            if index == 0:
-                continue
-            enclosing_start = starts[index - 1]
-            enclosing = self.func_db[enclosing_start]
-            enclosing_end = enclosing.get("end", enclosing_start)
-            end = starts[index] if index < len(starts) else enclosing_end
-            if target < enclosing_end:
-                end = min(end, enclosing_end)
-            if end <= target:
-                continue
-            raw_bytes = self._read_func_bytes(target, end)
-            if not raw_bytes:
-                continue
-            instructions = self.disasm.disassemble_function(
-                raw_bytes, target, end)
-            if not instructions:
-                continue
-            # Reject a body that neither leaves nor continues into an entry.
-            if not (any(insn.is_terminator for insn in instructions)
-                    or (instructions[-1].end_address == end
-                        and end in self.func_db)):
-                continue
+        # A table ends where the next indexed jump's table begins.
+        tables = sorted({table for _, _, table in sites})
+        arms = {}
+        for start, end, table in sites:
+            following = bisect.bisect_right(tables, table)
+            limit = table + 4 * 256
+            if following < len(tables):
+                limit = min(limit, tables[following])
+            # MSVC places a switch table after the code it indexes.
+            targets = self._read_bounded_jump_table(table, start, limit)
+            if all(start <= target < end for target in targets):
+                continue  # lifted as in-function gotos
+            for target in targets:
+                if target not in self.func_db:
+                    callers, upper = arms.get(target, (set(), table))
+                    callers.add(start)
+                    arms[target] = (callers, min(upper, table))
 
+        for target, (callers, upper) in sorted(arms.items()):
+            recovered = self._recover_cfg(target, upper, set(), set())
+            if recovered is None or not recovered[0]:
+                continue
+            instructions, jump_tables, _ = recovered
+            end = max(insn.end_address for insn in instructions)
+            if not any(insn.is_terminator for insn in instructions):
+                continue  # runs off its range; not a whole arm
+            enclosing = self.func_db[max(
+                start for start in callers)]
             self.func_db[target] = {
                 "_addr": target,
                 "start": f"0x{target:08X}",
@@ -830,12 +822,32 @@ class FunctionTranslator:
                 "num_instructions": len(instructions),
                 "has_prologue": False,
                 "calls_to": [],
-                "called_by": sorted(arms[target]),
+                "called_by": sorted(callers),
             }
-            bisect.insort(starts, target)
+            self._recovered_cfg[target] = {
+                "end": end,
+                "instructions": instructions,
+                "jump_tables": jump_tables,
+            }
             self.jump_table_entry_starts.add(target)
 
         return self.jump_table_entry_starts
+
+    def _read_bounded_jump_table(self, table_va, lower, limit):
+        """Read table entries in [table_va, limit) that point into
+        [lower, table_va). Slot zero may be an unreachable biased slot."""
+        targets = []
+        for entry_va in range(table_va, limit, 4):
+            offset = va_to_file_offset(entry_va)
+            if offset is None or offset + 4 > len(self.xbe_data):
+                break
+            target = struct.unpack_from('<I', self.xbe_data, offset)[0]
+            if not (lower <= target < table_va):
+                if entry_va == table_va:
+                    continue
+                break
+            targets.append(target)
+        return targets
 
     def _recover_cfg(self, start, upper, bridge_targets, stop_addresses):
         """Decode direct CFG edges and local indexed-table destinations."""
