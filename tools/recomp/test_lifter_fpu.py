@@ -34,6 +34,40 @@ class FpuLifterTest(unittest.TestCase):
             ["MEMF(esp + 0x18) = (float)fp_top(); fp_pop(); /* fstp */"],
         )
 
+    def test_fstp_with_stack_register_operand_still_pops(self):
+        """fstp st(0) is the idiom for discarding st0; the pop must survive.
+
+        Regression for round 71: the pop used to be emitted only inside the
+        memory-operand branch, so every "fstp st(i)" lifted to a bare comment
+        and silently leaked an x87 stack slot.
+        """
+        discard = Instruction(0, 2, "fstp", "st(0)", "ddd8")
+        discard.operands = [Operand(type="reg", reg="st(0)")]
+
+        self.assertEqual(
+            Lifter().lift_instruction(discard),
+            ["fp_pop(); /* fstp st(0) */"],
+        )
+
+    def test_fstp_to_a_higher_stack_slot_copies_then_pops(self):
+        store = Instruction(0, 2, "fstp", "st(3)", "dddb")
+        store.operands = [Operand(type="reg", reg="st(3)")]
+
+        self.assertEqual(
+            Lifter().lift_instruction(store),
+            ["g_fp_stack[(g_fp_top + 3) & 7] = fp_top(); fp_pop(); "
+             "/* fstp st(3) */"],
+        )
+
+    def test_fst_with_stack_register_operand_does_not_pop(self):
+        store = Instruction(0, 2, "fst", "st(1)", "ddd1")
+        store.operands = [Operand(type="reg", reg="st(1)")]
+
+        self.assertEqual(
+            Lifter().lift_instruction(store),
+            ["fp_st1() = fp_top(); /* fst st(1) */"],
+        )
+
     def test_qword_integer_conversion_uses_signed_64_bit_storage(self):
         operand = Operand(type="mem", mem_base="esp", mem_disp=0x10,
                           mem_size=8)
