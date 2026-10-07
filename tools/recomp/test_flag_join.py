@@ -33,7 +33,23 @@ def test_mixed_operations_are_not_guessed():
     b = Operand(type='reg', reg='edx')
     assert _merge_flag_states([('cmp', [a, b]), ('test', [a, b])]) is None
 
-def test_mixed_widths_are_not_guessed():
-    wide = [Operand(type='reg', reg='eax'), Operand(type='reg', reg='edx')]
-    narrow = [Operand(type='reg', reg='al'), Operand(type='reg', reg='dl')]
-    assert _merge_flag_states([('cmp', wide), ('cmp', narrow)]) is None
+def translate_width_join(consumer):
+    # test ecx,ecx; jz narrow; cmp ecx,eax; jmp join;
+    # narrow: cmp al,1; join: consumer +1; inc eax; ret.
+    image = bytes.fromhex('85c9740439c1eb023c01') + consumer + bytes.fromhex('40c3')
+    config._install([config.Section('.text', BASE, len(image), 0, len(image), True)],
+                    entry_point=BASE, kernel_thunk_addr=BASE,
+                    origin='flag-join-test')
+    db = {BASE: {'start': hex(BASE), 'end': BASE + len(image),
+                 '_addr': BASE, 'size': len(image)}}
+    return FunctionTranslator(image, db).translate_function(BASE, db[BASE])
+
+def test_mixed_width_compares_join_for_jne():
+    code = translate_width_join(bytes.fromhex('7501'))
+    assert 'CMP_NE(_fa, _fb)' in code, code
+    assert '_flags /* jne' not in code, code
+
+def test_mixed_widths_keep_the_fallback_for_sign():
+    # SF is the top bit at each compare's own width; no one expression fits.
+    code = translate_width_join(bytes.fromhex('7801'))
+    assert '_flags /* js' in code, code
