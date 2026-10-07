@@ -30,6 +30,12 @@ CASES = (
     # SSE conversions under MXCSR, rcp/rsqrt estimates, SSE2 scalar doubles.
     "cvts", "cvtt", "cvtps", "cvtpi", "rcp", "rsqrt", "addsd", "subsd",
     "mulsd", "divsd", "minsd", "maxsd", "sqrtsd", "comisd", "ucomisd",
+    # Integer flags: OF, PF and the signed conditions after each setter.
+    "int_cmp8_j", "int_cmp32_j", "int_cmp_imm16_j", "int_test_self8_j",
+    "int_add8_j", "int_add32_j", "int_sub8_j", "int_sub16_j", "int_and32_j",
+    "int_or8_j", "int_xor16_j", "int_adc8_j", "int_sbb32_j", "int_neg8_j",
+    "int_neg32_j", "int_shr_18_j", "int_sar_116_j", "int_imul16_j",
+    "int_imul32_j", "int_sub32_clobber_j",
 )
 
 
