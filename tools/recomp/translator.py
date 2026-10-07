@@ -392,11 +392,34 @@ class FunctionTranslator:
         self._ownership_ready = False
 
     def discover_static_indirect_targets(self, *, coalescing=False):
-        """Recover function entries from bounded static callback tables."""
+        """Recover callbacks and the gap entries their bodies reference."""
+        callers = None
+        while True:
+            before = set(self.func_db)
+            self._discover_static_indirect_targets(coalescing, callers)
+            callers = set(self.func_db) - before
+            if not callers:
+                return self.recovered_function_starts
+
+    def _discover_static_indirect_targets(self, coalescing, callers):
+        """Scan each newly recovered body once, keeping existing owners intact."""
         original_starts = sorted(self.func_db)
+        # An alias's end is borrowed from the body it enters or, in a gap, runs
+        # to the next known start, so it says nothing about the bytes after the
+        # alias's own code. Dead or Alive 3 has 17 _initterm initializers in a
+        # 100 KB gap that only gap aliases claim; letting an alias range hide
+        # them left the CRT calling addresses with no body.
+        owner_starts = [
+            start for start in original_starts
+            if self.func_db[start].get("detection_method") != "tail_jump_alias"]
         recovered_callers = {}
+        # Targets named by a callback table or a direct branch. Everything
+        # else came only from an immediate, which may be a plain constant.
+        strong = set()
 
         for caller, func_info in list(self.func_db.items()):
+            if callers is not None and caller not in callers:
+                continue
             end = func_info.get("end", caller)
             recovered = self._recovered_cfg.get(caller)
             if recovered and recovered.get("instructions"):
@@ -408,6 +431,15 @@ class FunctionTranslator:
                     continue
                 instructions = self.disasm.disassemble_function(
                     raw_bytes, caller, end)
+            # Linear decoding runs on through inline data and past exits;
+            # only reachable code names constants, and a callback accepted for
+            # its linear ret also takes its tables and callees from it.
+            reachable = instructions
+            if not (recovered and recovered.get("instructions")):
+                reachable = (self._recover_cfg(
+                    caller, end, set(), set(), coalescing=True) or [[]])[0]
+            if caller in self.recovered_function_starts:
+                instructions = reachable
             for lower, upper in self._find_static_indirect_ranges(instructions):
                 targets = self._read_static_callback_table(
                     lower, upper, original_starts)
@@ -416,13 +448,7 @@ class FunctionTranslator:
                 for target in targets:
                     if target in self.func_db:
                         if coalescing:
-                            callers = {
-                                int(value, 16) if isinstance(value, str) else value
-                                for value in self.func_db[target].get("called_by") or []
-                            }
-                            callers.add(caller)
-                            self.func_db[target]["called_by"] = [
-                                f"0x{value:08X}" for value in sorted(callers)]
+                            self._add_caller(target, caller)
                         continue
                     if coalescing:
                         index = bisect.bisect_right(original_starts, target)
@@ -434,33 +460,209 @@ class FunctionTranslator:
                                     f"Static callback 0x{target:08X} lies inside "
                                     f"coalesced function 0x{owner:08X}")
                     recovered_callers.setdefault(target, set()).add(caller)
+                    strong.add(target)
+            if caller in self.recovered_function_starts:
+                for insn in instructions:
+                    # The lifter emits a jmp or jcc that leaves the body as a
+                    # tail call. A branch inside it is not entry evidence.
+                    target = insn.call_target if insn.is_call else insn.jump_target
+                    if target is None or (
+                            not insn.is_call and caller <= target < end):
+                        continue
+                    if target in self.func_db:
+                        # A recovered callback is new to the function list,
+                        # so its decoded edges are not in called_by yet.
+                        if not caller <= target < end:
+                            self._add_caller(target, caller)
+                        continue
+                    recovered_callers.setdefault(target, set()).add(caller)
+                    strong.add(target)
+            # A callback can also be passed or stored as an immediate:
+            # DOA3 registers 0x0016C0B0 with `push imm; call eax`. Sizes and
+            # flags look the same, so the checks below hold an immediate to its
+            # own section, keep it out of every existing range, and require
+            # its reachable code to close.
+            for insn in reachable:
+                operands = insn.operands
+                if insn.mnemonic == "push" and operands:
+                    source = operands[0]
+                elif (insn.mnemonic == "mov" and len(operands) >= 2
+                        and operands[0].type == "mem"):
+                    source = operands[1]
+                else:
+                    continue
+                if source.type == "imm" and source.imm not in self.func_db:
+                    recovered_callers.setdefault(source.imm, set()).add(caller)
 
+        # End of the code claimed by entries accepted earlier in this pass;
+        # original_starts does not list them yet.
+        claimed_end = 0
         for target, callers in sorted(recovered_callers.items()):
             next_index = bisect.bisect_right(original_starts, target)
-            if next_index == 0 or next_index >= len(original_starts):
+            # Before the first start, only a table or branch names code.
+            if next_index == 0 and target not in strong:
                 continue
-            previous = self.func_db[original_starts[next_index - 1]]
-            next_start = original_starts[next_index]
-            next_func = self.func_db[next_start]
-            if previous.get("end", previous["_addr"]) > target:
+            # Past the last start, the section end alone bounds the candidate.
+            next_start = (original_starts[next_index]
+                          if next_index < len(original_starts) else None)
+            next_func = self.func_db[next_start] if next_start is not None else {}
+            # Decode no further than the target's own section: the next start
+            # can sit in another section, and the bytes between are not
+            # contiguous in the file.
+            home = next((s for s in _config._SECTIONS
+                         if s.va <= target < s.va + s.va_size), None)
+            if home is None:
                 continue
-            section = next_func.get("section", "")
-            if section in (".rdata", ".data"):
+            bound = home.va + min(home.va_size, home.raw_size)
+            if next_start is not None:
+                bound = min(bound, next_start)
+            if bound <= target:
+                continue
+            weak = target not in strong
+            if weak:
+                if target < claimed_end or not is_code_address(target):
+                    continue
+                # An alias's range runs on to the next start, past its own
+                # code. A constant inside the code the alias reaches is part
+                # of that body; past it, the bytes can be a separate function.
+                previous = self.func_db[original_starts[next_index - 1]]
+                if (previous.get("detection_method") == "tail_jump_alias"
+                        and previous.get("end", previous["_addr"]) > target):
+                    body = self._recover_cfg(
+                        previous["_addr"], previous["end"], set(), set(),
+                        coalescing=True)
+                    if not body or any(insn.address <= target < insn.end_address
+                                       for insn in body[0]):
+                        continue
+            owner_index = bisect.bisect_right(owner_starts, target)
+            overlapping_owner = None
+            if owner_index:
+                owner = self.func_db[owner_starts[owner_index - 1]]
+                if owner.get("end", owner["_addr"]) > target:
+                    if owner["_addr"] in self.coalesced_function_starts:
+                        continue
+                    # Linear decoding can run through a trailing switch table
+                    # into a separate callback. Only trim that overlap after
+                    # proving the owner's table-aware CFG ends before it. A
+                    # callback recovered here only guessed its end, so its
+                    # proven CFG may expose a later helper without a table.
+                    guessed = owner["_addr"] in self.recovered_function_starts
+                    recovered_owner = self._recover_cfg(
+                        owner["_addr"], owner["end"], set(), set(), coalescing=True)
+                    if not recovered_owner:
+                        continue
+                    owned, tables, _ = recovered_owner
+                    if (not owned or (not tables and not guessed)
+                            or any(insn.end_address > target for insn in owned)
+                            # Tables in .rdata live elsewhere; only embedded
+                            # storage can overlap the callback.
+                            or any(hi > target
+                                   for lo, hi in (self._table_storage(table, arms)
+                                                  for table, arms in tables.items())
+                                   if owner["_addr"] <= lo < owner["end"])
+                            or any(insn.is_jump and insn.jump_target is None
+                                   and not (insn.operands
+                                            and insn.operands[0].type == "mem"
+                                            and insn.operands[0].mem_disp in tables)
+                                   and not (guessed and self._is_pointer_tail_jump(
+                                       insn, tables))
+                                   for insn in owned)):
+                        continue
+                    overlapping_owner = owner, owned, tables
+            section = home.name
+            if not home.is_code:
                 continue
 
-            raw_bytes = self._read_func_bytes(target, next_start)
+            raw_bytes = self._read_func_bytes(target, bound)
             if not raw_bytes:
                 continue
             instructions = self.disasm.disassemble_function(
-                raw_bytes, target, next_start)
-            if not instructions or not any(insn.is_ret for insn in instructions):
-                continue
+                raw_bytes, target, bound)
+            # A callback that decodes straight into an alias start continues in
+            # that alias's body, and translation bridges the fallthrough to it.
+            # DOA3's initializer 0x0019EC10 has two aliases inside it before
+            # its ret.
+            falls_into_alias = bool(instructions) and (
+                next_func.get("detection_method") == "tail_jump_alias"
+                and instructions[-1].address + instructions[-1].size
+                == next_start)
+            # A linear decode can reach a ret through data, so an immediate
+            # must also pass the reachable-CFG check.
+            if weak or not instructions or not (
+                    falls_into_alias
+                    or any(insn.is_ret for insn in instructions)):
+                # Fiber/task callbacks may loop forever. Accept only a closed
+                # bounded CFG that exits or loops: every edge must reach a
+                # decoded instruction, including indexed table arms. A jmp, or
+                # the taken edge of a jcc, may leave as a tail call to an
+                # existing function or to code past this range (the next pass
+                # recovers it as a dependency); a jmp may also leave through a
+                # register or plain memory pointer.
+                recovered = self._recover_cfg(
+                    target, bound, set(), set(), coalescing=True)
+                if not recovered:
+                    continue
+                decoded, tables, _ = recovered
+                starts = {insn.address for insn in decoded}
+                # MSVC pads a no-return call (ExitThread) with int3.
+                call_ends = {insn.end_address for insn in decoded if insn.is_call}
+                closed = bool(decoded)
+                backward = False
+                exits = False
+                for insn in decoded:
+                    if insn.mnemonic == "int3" and insn.address in call_ends:
+                        exits = True
+                        continue
+                    if insn.is_ret:
+                        exits = True
+                        continue
+                    if insn.mnemonic in ("int3", "ud2", "hlt", "iret", "iretd"):
+                        closed = False
+                    if self._is_pointer_tail_jump(insn, tables):
+                        exits = True
+                        continue
+                    edges = []
+                    if insn.is_jump or insn.jump_target is not None:
+                        edges = ([insn.jump_target] if insn.jump_target is not None
+                                 else tables.get(insn.operands[0].mem_disp, [])
+                                 if insn.operands and insn.operands[0].type == "mem"
+                                 else [])
+                        if not edges:
+                            closed = False
+                    if insn.mnemonic != "jmp":
+                        edges = [*edges, insn.end_address]
+                    for edge in edges:
+                        if edge in starts:
+                            continue
+                        if (insn.mnemonic == "jmp" or edge == insn.jump_target) and (
+                                edge in self.func_db
+                                or (not target <= edge < bound
+                                    and is_code_address(edge))):
+                            exits = True
+                            continue
+                        closed = False
+                    backward |= any(edge <= insn.address for edge in edges)
+                if not closed or not (backward or exits):
+                    continue
+                instructions = decoded
+                self._recovered_cfg[target] = {
+                    "end": bound, "instructions": decoded,
+                    "jump_tables": tables,
+                }
 
+            if overlapping_owner is not None:
+                owner, owned, tables = overlapping_owner
+                owner["end"] = target
+                owner["size"] = target - owner["_addr"]
+                owner["num_instructions"] = len(owned)
+                self._recovered_cfg[owner["_addr"]] = {
+                    "end": target, "instructions": owned, "jump_tables": tables,
+                }
             self.func_db[target] = {
                 "_addr": target,
                 "start": f"0x{target:08X}",
-                "end": next_start,
-                "size": next_start - target,
+                "end": bound,
+                "size": bound - target,
                 "name": self.label_db.get(target, f"sub_{target:08X}"),
                 "section": section,
                 "confidence": 0.9,
@@ -471,8 +673,57 @@ class FunctionTranslator:
                 "called_by": sorted(callers),
             }
             self.recovered_function_starts.add(target)
+            # Claim only what the callback reaches: a linear decode accepted
+            # for its ret runs on to the bound.
+            claimed = instructions
+            tables = (self._recovered_cfg.get(target) or {}).get("jump_tables", {})
+            if target not in self._recovered_cfg:
+                reach = self._recover_cfg(target, bound, set(), set(), coalescing=True)
+                if reach and reach[0]:
+                    claimed, tables = reach[0], reach[1]
+            storage = [self._table_storage(table, arms) for table, arms in tables.items()]
+            claimed_end = max(
+                claimed_end, *(insn.end_address for insn in claimed),
+                *(hi for lo, hi in storage if target <= lo < bound))
 
         return self.recovered_function_starts
+
+    def _table_storage(self, table_va, arms):
+        """Return the [start, end) bytes that hold a recovered table's arms.
+
+        _read_local_jump_table can scan backward from the base or start at
+        slot one, so the base and entry count alone do not give the span.
+        Find the arms in the image; if they are not there, assume the widest
+        span the reader could have used.
+        """
+        size = 4 * len(arms)
+        starts = [table_va - 4 * back for back in range(len(arms) + 1)]
+        for start in starts + [table_va + 4]:
+            offset = va_to_file_offset(start)
+            if offset is None or offset + size > len(self.xbe_data):
+                continue
+            if list(struct.unpack_from(f"<{len(arms)}I", self.xbe_data, offset)) == list(arms):
+                return start, start + size
+        return table_va - size, table_va + size + 4
+
+    @staticmethod
+    def _is_pointer_tail_jump(insn, tables):
+        """Return whether insn tail-calls through a register or plain pointer."""
+        operand = insn.operands[0] if insn.operands else None
+        return (insn.mnemonic == "jmp" and insn.jump_target is None
+                and operand is not None
+                and (operand.type == "reg"
+                     or (operand.type == "mem" and not operand.mem_index
+                         and operand.mem_disp not in tables)))
+
+    def _add_caller(self, target, caller):
+        """Record caller as independent entry evidence for target."""
+        known = {
+            int(value, 16) if isinstance(value, str) else value
+            for value in self.func_db[target].get("called_by") or []}
+        known.add(caller)
+        self.func_db[target]["called_by"] = [
+            f"0x{value:08X}" for value in sorted(known)]
 
     def coalesce_function(self, target, end, expected_starts):
         """Merge an explicitly named set of false interior function starts.
@@ -863,7 +1114,11 @@ class FunctionTranslator:
                     addr for addr in weak_starts[weak_index:]
                     if addr < upper and addr in cfg_targets
                 }
-                if not owned:
+                # Every path into a hand-written entry must reach it, so an
+                # owner whose CFG branches or falls through to one stays split.
+                falls_into = {insn.end_address for insn in instructions
+                              if not insn.is_terminator}
+                if not owned or (owned | falls_into) & self.protected_function_starts:
                     continue
 
                 self.owned_function_starts.update(owned)
@@ -2823,6 +3078,13 @@ class BatchTranslator:
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
 
+        # A wrapped function's body is sub_X_gen; the hand-written sub_X is
+        # what callers and indirect dispatch must reach, so declare it like
+        # any hand-written function.
+        for addr, func_info in func_list:
+            if func_info.get("wrapper_name"):
+                manual_decls[addr] = func_info["wrapper_name"]
+
         # Any address called but never defined needs a stub, or the link fails.
         # These are almost all mid-function entry points the function detector
         # did not split out: a call lands a few bytes inside (or just past) a
@@ -3039,8 +3301,8 @@ class BatchTranslator:
         # Sorted by address: recomp_lookup binary-searches this array, so an
         # appended entry would silently break every lookup past it.
         dispatch_entries = sorted(
-            list(translations) + [(addr, name, None)
-                                  for addr, name in manual_decls.items()],
+            [entry for entry in translations if entry[0] not in manual_decls]
+            + [(addr, name, None) for addr, name in manual_decls.items()],
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
         self._write_dispatch_table(dispatch_entries, dispatch_path, header_name)
