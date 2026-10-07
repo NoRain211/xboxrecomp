@@ -384,6 +384,10 @@ ZF_FROM_DEST = frozenset({
     "adc", "sbb", "shl", "shr", "sar",
 })
 
+# Flag-setter prefix for a join of same-kind cmp/test snapshots taken at
+# different operand widths; see translator._merge_flag_states.
+MIXED_WIDTH = "__mixed_width_"
+
 # Additional instructions that modify EFLAGS (tracked but handled as generic)
 _EFLAGS_SETTERS = frozenset({
     "shld", "shrd", "rol", "ror", "rcl", "rcr",  # Shifts/rotates set CF
@@ -510,6 +514,16 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if not cond_info:
         return None
     cmp_macro, test_macro, desc = cond_info
+
+    # A join of cmp (or test) snapshots taken at different widths: flag_ops
+    # holds one operand list per width. A condition whose text is the same
+    # for every width reads only the width-normalised snapshot and holds on
+    # every path; one that differs (js/jns pick their sign bit by width)
+    # keeps the fallback.
+    if flag_setter.startswith(MIXED_WIDTH):
+        kind = flag_setter[len(MIXED_WIDTH):]
+        answers = {_make_condition(jcc, kind, ops) for ops in flag_ops}
+        return answers.pop() if len(answers) == 1 else None
 
     # A join whose predecessors disagree on which instruction set the flags,
     # but agree that the zero flag came from the same destination register.

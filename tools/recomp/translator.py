@@ -25,7 +25,8 @@ from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
-                     detect_setjmp_helpers, _func_ident, _operand_width)
+                     detect_setjmp_helpers, _func_ident, _operand_width,
+                     MIXED_WIDTH)
 
 
 def _merge_flag_states(states):
@@ -33,8 +34,16 @@ def _merge_flag_states(states):
 
     CMP/TEST save their operands into function-local _fa/_fb/_fas/_fbs at
     runtime. A shared consumer can use whichever predecessor executed. Keep
-    operation and width equal because sign/parity handling depends on them;
-    arithmetic states still reconstruct operands and cannot use this merge.
+    the operation equal; arithmetic states still reconstruct operands and
+    cannot use this merge.
+
+    Widths may differ. The snapshot is already masked and sign-extended at
+    each compare's own width, so most conditions read the same either way;
+    the merged state keeps one operand list per width and _make_condition
+    answers only where they agree. DOA3's "is this fighter in move list N"
+    check reaches its jne from a `cmp al, 1` and a `cmp ecx, eax`; refusing
+    the merge left the branch on the dead _flags, the check always said yes,
+    and the stage wall clamp skipped both fighters every frame.
     """
     if not states or any(not state or not state[0] for state in states):
         return None
@@ -42,13 +51,15 @@ def _merge_flag_states(states):
     if all(state == first for state in states[1:]):
         return first
     if first[0] in ("cmp", "test") and len(first[1]) == 2:
-        width = _operand_width(first[1][0]) or _operand_width(first[1][1])
-        for kind, ops in states[1:]:
+        by_width = {}
+        for kind, ops in states:
             if kind != first[0] or len(ops) != 2:
                 return None
-            if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
-                return None
-        return first
+            by_width.setdefault(
+                _operand_width(ops[0]) or _operand_width(ops[1]), ops)
+        if len(by_width) == 1:
+            return first
+        return (MIXED_WIDTH + first[0], list(by_width.values()))
     return _merge_zero_flag(states)
 
 
