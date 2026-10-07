@@ -67,6 +67,64 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 /* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */
 #define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)(va) + g_xbox_mem_offset) : NULL)
 
+/* ── Guest buffers the host is about to touch ───────────
+ *
+ * A bridge turns a guest VA into a host pointer by adding an offset, so a VA
+ * the guest got wrong does not fail the call -- it faults inside the kernel
+ * implementation, on a host stack with no recompiled frame in it and a fault
+ * address that means nothing on its own.
+ *
+ * The dangerous shape is an address AND a length that both come from the
+ * guest. NtReadFile is the clearest case: the host WRITES `length` bytes
+ * through the pointer, so a buffer near the top of the mapping, or a length
+ * that does not match the buffer it names, walks the host past the end of
+ * guest memory writing file contents into whatever follows. Nothing above this
+ * layer can catch it, because xbox_NtReadFile receives a host pointer and a
+ * count and cannot know where the mapping ends.
+ */
+static int bridge_va_mapped(uint32_t va, uint32_t bytes)
+{
+    uint64_t end = (uint64_t)va + bytes;
+    uint64_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+
+    if (va < 0x1000)            /* page zero is deliberately unmapped */
+        return 0;
+    if (end <= mapped)
+        return 1;
+    return va >= XBOX_CONTIG_BASE
+        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+}
+
+/* STATUS_ACCESS_VIOLATION is what NT answers for a user buffer it cannot
+ * touch, and it is far more useful to a title than a host crash: the call
+ * fails, the guest gets a status it has a branch for, and the log names the
+ * export, the buffer and the length. Warned once per export so a title that
+ * does this in a loop does not bury the rest of the log. */
+static int bridge_buf_ok(uint32_t va, uint32_t bytes, const char *export_name)
+{
+    static const char *seen[16];
+    static int distinct;
+    int i;
+
+    if (!bytes)                                   /* nothing is accessed */
+        return 1;
+    if (va && bridge_va_mapped(va, bytes))
+        return 1;
+
+    for (i = 0; i < distinct; ++i)
+        if (seen[i] == export_name)
+            return 0;
+    if (distinct < (int)(sizeof(seen) / sizeof(seen[0])))
+        seen[distinct++] = export_name;
+
+    fprintf(stderr,
+            "  [KERNEL] %s: buffer 0x%08X length %u is not mapped guest "
+            "memory; returning STATUS_ACCESS_VIOLATION\n",
+            export_name, va, (unsigned)bytes);
+    fflush(stderr);
+    return 0;
+}
+
 /* ── Synthetic VA range (for function exports) ─────────── */
 
 #define KERNEL_VA_BASE  0xFE000000u
@@ -588,6 +646,12 @@ static void bridge_PsCreateSystemThreadEx(void)
  * NTSTATUS NtClose(HANDLE Handle)
  * Handle is a value (not a pointer), so safe for generic call.
  */
+
+/* Asynchronous-handle bookkeeping, defined with the file bridges below. */
+static void bridge_note_async_handle(uint32_t token);
+static void bridge_forget_async_handle(uint32_t token);
+static int  bridge_handle_is_async(uint32_t token);
+
 /* Handle-table helpers; defined further below. Xbox memory slots are 32-bit
  * but native HANDLEs are 64-bit pointers, so handles are kept in a table and
  * referenced by tagged 32-bit tokens. */
@@ -602,6 +666,8 @@ static void bridge_NtClose(void)
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
         fflush(stderr);
     }
+
+    bridge_forget_async_handle(raw_handle);
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
@@ -1808,7 +1874,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     return 1;
 }
 
@@ -1860,10 +1926,7 @@ static void bridge_KeSynchronizeExecution(void)
  * routine has already run and there is nothing to cancel. FALSE is both the
  * honest answer and the one that keeps a caller's bookkeeping right.
  */
-static void bridge_KeRemoveQueueDpc(void)
-{
-    g_eax = 0;
-}
+static void bridge_KeRemoveQueueDpc(void);   /* defined with the queue */
 
 /* The pending DPC queue.
  *
@@ -1887,6 +1950,33 @@ typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
 static volatile LONG g_dpc_head, g_dpc_tail;
 
+/* The queue is fed from several host threads at once -- the USB and APU
+ * controller threads raise interrupts whose ISRs queue DPCs, and the title
+ * queues its own -- and was an unlocked ring: two inserts could take the same
+ * slot and one DPC was lost. A lost USB DPC is a done queue the driver never
+ * acknowledges; the controller then completes nothing more and the pad goes
+ * dead mid-game, which is what it did.
+ *
+ * And a DPC already queued is not queued twice: the kernel keeps an Inserted
+ * flag in the KDPC (+2) and KeInsertQueueDpc returns FALSE while it is set.
+ * Running a driver's DPC twice for one interrupt makes it walk a done list it
+ * has already consumed. */
+static CRITICAL_SECTION g_dpc_lock;
+static INIT_ONCE g_dpc_lock_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK dpc_lock_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&g_dpc_lock);
+    return TRUE;
+}
+
+static void dpc_lock(void)
+{
+    InitOnceExecuteOnce(&g_dpc_lock_once, dpc_lock_init, NULL, NULL);
+    EnterCriticalSection(&g_dpc_lock);
+}
+
 static void bridge_KeInsertQueueDpc(void)
 {
     uint32_t dpc  = STACK_ARG(0);
@@ -1896,9 +1986,16 @@ static void bridge_KeInsertQueueDpc(void)
 
     if (!dpc) { g_eax = 0; return; }
 
+    dpc_lock();
+    if (BRIDGE_MEM8(dpc + 2)) {                 /* already queued */
+        LeaveCriticalSection(&g_dpc_lock);
+        g_eax = 0;
+        return;
+    }
     tail = g_dpc_tail;
     next = (tail + 1) % XBOX_MAX_PENDING_DPC;
     if (next == g_dpc_head) {
+        LeaveCriticalSection(&g_dpc_lock);
         fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
         fflush(stderr);
         g_eax = 0;
@@ -1907,8 +2004,30 @@ static void bridge_KeInsertQueueDpc(void)
     g_dpc_queue[tail].dpc  = dpc;
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
+    BRIDGE_MEM8(dpc + 2) = 1;
     g_dpc_tail = next;
+    LeaveCriticalSection(&g_dpc_lock);
     g_eax = 1;
+}
+
+/* Cancel a queued DPC: take it out of the queue if it is still there. */
+static void bridge_KeRemoveQueueDpc(void)
+{
+    uint32_t dpc = STACK_ARG(0);
+    LONG i;
+
+    g_eax = 0;
+    if (!dpc)
+        return;
+    dpc_lock();
+    if (BRIDGE_MEM8(dpc + 2)) {
+        for (i = g_dpc_head; i != g_dpc_tail; i = (i + 1) % XBOX_MAX_PENDING_DPC)
+            if (g_dpc_queue[i].dpc == dpc)
+                g_dpc_queue[i].dpc = 0;         /* drained as a no-op */
+        BRIDGE_MEM8(dpc + 2) = 0;
+        g_eax = 1;
+    }
+    LeaveCriticalSection(&g_dpc_lock);
 }
 
 /* Call a connected interrupt service routine.
@@ -1943,7 +2062,7 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     return (int)(g_eax & 1u);
 }
 
@@ -2010,11 +2129,22 @@ static void kernel_vblank_tick(void)
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
 {
-    while (g_dpc_head != g_dpc_tail) {
-        LONG head = g_dpc_head;
-        PendingDpc d = g_dpc_queue[head];
-        g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
-        kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+    for (;;) {
+        PendingDpc d;
+        dpc_lock();
+        if (g_dpc_head == g_dpc_tail) {
+            LeaveCriticalSection(&g_dpc_lock);
+            break;
+        }
+        d = g_dpc_queue[g_dpc_head];
+        g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
+        /* Cleared before the routine runs, as the kernel does: the routine
+         * may queue itself again. */
+        if (d.dpc)
+            BRIDGE_MEM8(d.dpc + 2) = 0;
+        LeaveCriticalSection(&g_dpc_lock);
+        if (d.dpc)
+            kernel_run_dpc(d.dpc, d.arg1, d.arg2);
     }
 }
 
@@ -2030,6 +2160,15 @@ static void bridge_KeInitializeDpc(void)
     uint32_t dpc_va = STACK_ARG(0);
     uint32_t routine = STACK_ARG(1);
     uint32_t context = STACK_ARG(2);
+
+    /* XBOX_TO_NATIVE maps a guest 0 to NULL, so an unchecked object pointer
+     * makes this memset write through NULL inside the bridge. The export
+     * returns void, so refusing is doing nothing -- which is what the real
+     * kernel does with an object it cannot write. */
+    if (!bridge_buf_ok(dpc_va, 32, "KeInitializeDpc")) {
+        g_eax = 0;
+        return;
+    }
 
     /* Zero the structure (32 bytes) */
     memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
@@ -2078,6 +2217,11 @@ static void bridge_KeInitializeInterrupt(void)
     uint32_t routine      = STACK_ARG(1);
     uint32_t context      = STACK_ARG(2);
     uint32_t vector       = STACK_ARG(3);
+
+    if (!bridge_buf_ok(interrupt_va, 44, "KeInitializeInterrupt")) {
+        g_eax = 0;
+        return;
+    }
 
     /* Xbox KINTERRUPT is 44 bytes. */
     memset(XBOX_TO_NATIVE(interrupt_va), 0, 44);
@@ -2472,6 +2616,10 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     static RECOMP_TLS char path[65536];
     uint16_t length=BRIDGE_MEM16(ansi_str_va);
     if(length>BRIDGE_MEM16(ansi_str_va+2)) return NULL;
+    /* Length <= MaximumLength says the string is self-consistent; it does not
+     * say the buffer it names is inside the mapping. Without this, a string
+     * near the top of guest memory reads up to 64 KB off the end. */
+    if (length && !bridge_va_mapped(buf_va, length)) return NULL;
     memcpy(path,XBOX_TO_NATIVE(buf_va),length);
     path[length]='\0';
     return path;
@@ -2751,6 +2899,11 @@ static void bridge_NtCreateFile(void)
         handle_va, access, obj_attrs, iostatus,
         file_attrs, share, disposition, options);
 
+    /* FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT. Neither set
+     * means the caller wants asynchronous completion on this handle. */
+    if (g_eax == 0 && handle_va && (options & 0x30u) == 0u)
+        bridge_note_async_handle(BRIDGE_MEM32(handle_va));
+
     /* An FMV the host can decode itself.
      *
      * The title's own decoder is emulated like everything else, but it only
@@ -3023,6 +3176,61 @@ static void bridge_RtlUnwind(void)
         g_esp += 0x50;
 }
 
+
+/* Which open file handles were asked for asynchronously.
+ *
+ * NtCreateFile takes FILE_SYNCHRONOUS_IO_ALERT (0x10) and
+ * FILE_SYNCHRONOUS_IO_NONALERT (0x20) in CreateOptions. With neither, the
+ * handle is asynchronous: NtReadFile on it returns STATUS_PENDING even with
+ * no event, and the caller waits on the handle. Completing every read
+ * synchronously answers a different question than the one that was asked.
+ *
+ * A flat array because a title has a handful of files open at once and a
+ * linear scan of sixty-four entries costs less than a hash would.
+ */
+#define BRIDGE_ASYNC_MAX 64
+static uint32_t g_async_handles[BRIDGE_ASYNC_MAX];
+
+static void bridge_note_async_handle(uint32_t token)
+{
+    int i;
+    if (!token)
+        return;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token)
+            return;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (!g_async_handles[i]) { g_async_handles[i] = token; return; }
+}
+
+static void bridge_forget_async_handle(uint32_t token)
+{
+    int i;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token) { g_async_handles[i] = 0; return; }
+}
+
+static int bridge_handle_is_async(uint32_t token)
+{
+    int i;
+    if (!token)
+        return 0;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token)
+            return 1;
+    return 0;
+}
+
+/* Off unless RECOMP_ASYNC_IO is set, so the two behaviours stay comparable
+ * rather than one being swapped in blind. */
+static int bridge_async_io_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_ASYNC_IO") ? 1 : 0;
+    return on;
+}
+
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
@@ -3036,6 +3244,11 @@ static void bridge_NtReadFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(buffer_va, length, "NtReadFile")) {
+        bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (offset_va) {
         off.LowPart  = BRIDGE_MEM32(offset_va);
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
@@ -3056,13 +3269,15 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
@@ -3071,6 +3286,24 @@ static void bridge_NtReadFile(void)
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
+
+    /* An asynchronous request returns STATUS_PENDING, even when the data was
+     * already there.
+     *
+     * A caller that asked to be told later is told later on Windows: the read
+     * returns 0x00000103 and the status block carries the result once the
+     * handle signals. Returning STATUS_SUCCESS instead is not a harmless
+     * shortcut, it is a different contract, and code written against the real
+     * one takes the branch that says nothing is in flight.
+     *
+     * The read itself stays synchronous here: the status block is already
+     * written and the event already signalled, so a caller that waits is
+     * satisfied immediately. Only the answer changes.
+     *
+     * An event or APC alone does not make a read asynchronous: on a
+     * synchronous handle the kernel waits and returns the final status. */
+    if (bridge_async_io_enabled() && bridge_handle_is_async(STACK_ARG(0)))
+        g_eax = STATUS_PENDING;
 }
 
 /* ── NtWriteFile (ordinal 236, 8 args = 32 bytes) ─────── */
@@ -3086,6 +3319,11 @@ static void bridge_NtWriteFile(void)
     PLARGE_INTEGER poff = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(buffer_va, length, "NtWriteFile")) {
+        bridge_write_iostatus(iostatus, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     if (offset_va) {
         off.LowPart  = BRIDGE_MEM32(offset_va);
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
@@ -3109,6 +3347,11 @@ static void bridge_NtQueryInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(info_va, length, "NtQueryInformationFile")) {
+        bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     g_eax = (uint32_t)xbox_NtQueryInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
@@ -3126,6 +3369,11 @@ static void bridge_NtSetInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(info_va, length, "NtSetInformationFile")) {
+        bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FILE_INFORMATION_CLASS)infoclass);
@@ -3143,6 +3391,11 @@ static void bridge_NtQueryVolumeInformationFile(void)
     XBOX_IO_STATUS_BLOCK ios;
 
     memset(&ios, 0, sizeof(ios));
+    if (!bridge_buf_ok(info_va, length, "NtQueryVolumeInformationFile")) {
+        bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
+        g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
     g_eax = (uint32_t)xbox_NtQueryVolumeInformationFile(handle, &ios,
                 XBOX_TO_NATIVE(info_va), length,
                 (XBOX_FS_INFORMATION_CLASS)infoclass);

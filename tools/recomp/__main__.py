@@ -19,53 +19,14 @@ Options:
 """
 
 import argparse
-import hashlib
 import json
 import os
-import re
 import sys
 import time
 
 from . import config
 from .translator import BatchTranslator
 from .output import write_summary, print_stats, generate_header
-
-
-def load_manual_call_targets(path, expected_sha256):
-    """Load a checked list of direct-call targets that use manual dispatch."""
-    if bool(path) != bool(expected_sha256):
-        raise ValueError(
-            "--manual-call-targets and --manual-call-targets-sha256 "
-            "must be supplied together")
-    if not path:
-        return frozenset(), None
-    if not re.fullmatch(r"[0-9A-Fa-f]{64}", expected_sha256):
-        raise ValueError("Manual-call target SHA-256 must be 64 hex digits")
-
-    with open(path, "rb") as target_file:
-        payload = target_file.read()
-    actual_sha256 = hashlib.sha256(payload).hexdigest()
-    if actual_sha256 != expected_sha256.lower():
-        raise ValueError(
-            "Manual-call target file does not match its authenticated SHA-256")
-
-    try:
-        entries = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"Invalid manual-call target JSON: {error}") from error
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("Manual-call target JSON must be a non-empty array")
-
-    targets = []
-    for entry in entries:
-        if not isinstance(entry, str) or not re.fullmatch(
-                r"0x[0-9A-Fa-f]{8}", entry):
-            raise ValueError(
-                "Manual-call targets must be canonical 0xXXXXXXXX strings")
-        targets.append(int(entry, 16))
-    if len(set(targets)) != len(targets):
-        raise ValueError("Manual-call target JSON contains duplicates")
-    return frozenset(targets), actual_sha256
 
 
 def find_data_files(disasm_dir=None, func_id_dir=None, abi_dir=None, overrides=None):
@@ -96,6 +57,17 @@ def find_data_files(disasm_dir=None, func_id_dir=None, abi_dir=None, overrides=N
             paths[key] = None
 
     return paths
+
+
+def _parse_force_returns(items):
+    """Parse --force-return ADDR=VALUE pairs into {addr: value}."""
+    out = {}
+    for item in items or ():
+        if "=" not in item:
+            raise SystemExit(f"--force-return wants ADDR=VALUE, got {item!r}")
+        addr, _, value = item.partition("=")
+        out[int(addr, 0)] = int(value, 0) & 0xFFFFFFFF  # -1 is 0xFFFFFFFF
+    return out
 
 
 def _load_addrs(path):
@@ -248,6 +220,10 @@ def main():
                         help="Path to abi_functions.json (overrides --abi-dir)")
     parser.add_argument("--skip-binary-check", action="store_true",
                         help="Allow disassembly recorded for a different binary")
+    parser.add_argument("--icall-sites", metavar="FILE", default=None,
+                        help="Per-site indirect-call targets from "
+                             "tools.recomp.icall_feedback merge (default: "
+                             "tools/recomp/output/icall_sites.json)")
     parser.add_argument("--manual-functions", metavar="FILE",
                         help="JSON list of addresses the project implements by "
                              "hand. Their bodies are not generated, so the "
@@ -265,14 +241,15 @@ def main():
                         help="JSON list of addresses to emit an entry trace "
                              "for (RECOMP_TRACE_ENTER). For bring-up: shows "
                              "which call in an init chain is not returning")
-    parser.add_argument("--recover-functions", metavar="JSON", action="append",
-                        help="JSON file of externally analyzed function bounds "
-                             "to adopt. May be repeated to layer recovery sets.")
-    parser.add_argument("--manual-call-targets",
-                        help="Authenticated JSON array of direct-call targets "
-                             "that must dispatch through manual lookup")
-    parser.add_argument("--manual-call-targets-sha256",
-                        help="Expected SHA-256 of --manual-call-targets")
+    parser.add_argument("--force-return", metavar="ADDR=VALUE",
+                        action="append", default=[],
+                        help="Make a function hand its callers a constant "
+                             "instead of what it computed, e.g. "
+                             "0x0015D780=0. Repeatable. A bring-up probe for "
+                             "a title waiting on a service the runtime does "
+                             "not implement yet: the body still runs, only "
+                             "the answer changes, and the emitted code is "
+                             "inert unless RECOMP_FORCE_RETURN is set")
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
@@ -282,14 +259,6 @@ def main():
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
 
     args = parser.parse_args()
-
-    try:
-        manual_call_targets, manual_call_targets_sha256 = (
-            load_manual_call_targets(
-                args.manual_call_targets,
-                args.manual_call_targets_sha256))
-    except (OSError, ValueError) as error:
-        parser.error(str(error))
 
     # Boundary repair is destructive: an interior function start disappears
     # once it is coalesced into its owner. Load hand-written entry points before
@@ -347,13 +316,14 @@ def main():
         abi_json_path=data_files.get("abi"),
         output_dir=args.output_dir,
         trace_functions=_load_addrs(args.trace_functions),
+        force_returns=_parse_force_returns(args.force_return),
         coalesce_json_paths=args.coalesce_functions,
         protected_function_starts=protected_function_starts,
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
-        recovery_json_path=args.recover_functions,
-        manual_call_targets=manual_call_targets,
-        manual_call_targets_sha256=manual_call_targets_sha256,
+        icall_sites_json_path=args.icall_sites or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "output",
+            "icall_sites.json"),
     )
 
     t_load = time.time() - t0

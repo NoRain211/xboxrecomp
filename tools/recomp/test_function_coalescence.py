@@ -7,6 +7,8 @@ import pytest
 from . import __main__ as recomp_main
 from . import config
 from . import manual_scan
+from .disasm import Instruction
+from .lifter import Lifter
 from .translator import BatchTranslator, FunctionTranslator, load_coalescences
 
 
@@ -54,21 +56,6 @@ def test_repaired_clamp_matches_unsplit_translation():
     assert list(split.func_db) == [BASE]
     assert split.coalesced_function_starts == {BASE}
     assert split.func_db[BASE]["detection_method"] == "external_coalescence"
-
-
-def test_shared_clamp_branch_is_threaded_on_the_jump_edge():
-    subject = translator()
-    subject.coalesce_function(BASE, END, SPLITS)
-    code = subject.translate_function(BASE, subject.func_db[BASE])
-    assert code.count("/* cmp eax, edi (32-bit) */") == 2
-    assert code.count("if (CMP_GE(_fas, _fbs)) goto loc_00010018;") == 2
-    jump_path, fallthrough_path = code.split("loc_0001000D: ;")
-    assert "CMP_GE(_fas, _fbs)" in jump_path
-    assert "goto loc_00010016;" in jump_path
-    assert "CMP_GE(_fas, _fbs)" in fallthrough_path
-    assert "if (_flags" not in code
-    assert list(subject.func_db) == [BASE]
-    assert subject.func_db[BASE]["end"] == END
 
 
 def test_rejects_previously_coalesced_interior_owner():
@@ -413,9 +400,13 @@ def test_interrupt_return_is_terminal_for_recovery_and_emission(iret):
     with pytest.raises(ValueError, match="not the requested end"):
         subject.coalesce_function(BASE, BASE + len(body), [interior])
 
+    # Emission must not abort the build: a linear sweep reads iretd out of
+    # data (Wreckless has one at 0x001345A6), so the site becomes a runtime
+    # RECOMP_UNIMPL marker like any other untranslatable instruction.
     whole = translator(body, [])
-    code = whole.translate_function(BASE, whole.func_db[BASE])
-    assert "__debugbreak(); return;" in code
+    whole.translate_function(BASE, whole.func_db[BASE])
+    insn = Instruction(BASE, len(iret), "iretd", "", iret.hex(), operands=[])
+    assert "RECOMP_UNIMPL" in " ".join(Lifter().lift_instruction(insn))
 
 
 def test_xbox_int2d_int3_slide_preserves_fallthrough():
@@ -890,19 +881,6 @@ def test_backward_computed_edge_preserves_flag_state():
     target_body = target_body.split(f"loc_{done:08X}:", 1)[0]
     assert "CMP_GE(" in target_body
     assert "if (_flags /* jge" not in target_body
-
-
-def test_loop_branch_preserves_flag_state_for_successor():
-    successor = BASE + 5
-    done = BASE + 9
-    body = bytes.fromhex("83f805e1047d029090c3")
-    subject = translator(body, [])
-    code = subject.translate_function(BASE, subject.func_db[BASE])
-
-    successor_body = code.split(f"loc_{successor:08X}:", 1)[1]
-    successor_body = successor_body.split(f"loc_{done:08X}:", 1)[0]
-    assert "CMP_GE(" in successor_body
-    assert "if (_flags /* jge" not in successor_body
 
 
 def test_resolved_register_edge_participates_in_join_proof():

@@ -184,7 +184,9 @@ class FlagSnapshotLifterTest(unittest.TestCase):
         generated = "\n".join(lifted)
 
         self.assertIn("_fas = (int32_t)(int8_t)(_fa)", generated)
-        self.assertIn("CMP_GE((int8_t)((_fas) & (_fbs)), 0)", generated)
+        # test al, al is normalised to cmp al, 0: SF and OF come from the
+        # sign-extended 8-bit snapshot, not from EAX after the clobber.
+        self.assertIn("if (CMP_GE(_fas, _fbs))", generated)
 
     def test_adjacent_jcc_needs_no_snapshot(self):
         """The adjacent pair is already exact, so nothing is captured."""
