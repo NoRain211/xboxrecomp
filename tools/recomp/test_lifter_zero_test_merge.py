@@ -20,7 +20,7 @@ with its vertical structure intact.
 import unittest
 
 from .disasm import BasicBlock, Instruction, Operand
-from .lifter import Lifter, lift_basic_block, normalise_zero_test
+from .lifter import JOINED, Lifter, lift_basic_block, normalise_zero_test
 from .translator import _merge_flag_states
 
 
@@ -66,12 +66,14 @@ class ZeroTestNormalisationTest(unittest.TestCase):
         self.assertIsNotNone(merged)
         self.assertEqual(merged[0], "cmp")
 
-    def test_a_genuine_test_still_refuses_to_merge_with_a_compare(self):
-        """`test eax, ebx` is a different operation and must not be folded in."""
+    def test_a_genuine_test_is_kept_apart_from_a_compare(self):
+        """`test eax, ebx` is a different operation and must not be folded in;
+        the join keeps both states and picks one by the setter's tag."""
         mem = Operand(type="mem", mem_base="ebp", mem_disp=-0x14, mem_size=4)
         from_cmp = ("cmp", [mem, Operand(type="imm", imm=0, mem_size=4)])
         from_test = ("test", [_reg("eax"), _reg("ebx")])
-        self.assertIsNone(_merge_flag_states([from_cmp, from_test]))
+        merged = _merge_flag_states([from_cmp, from_test])
+        self.assertEqual(merged, (JOINED, [from_cmp, from_test]))
 
     def test_fused_test_jcc_snapshots_the_form_it_records(self):
         """`test eax, eax; je` records `cmp eax, 0`, so its snapshot must be

@@ -26,7 +26,7 @@ from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width,
-                     MIXED_WIDTH)
+                     JOINED)
 
 
 def _merge_flag_states(states):
@@ -34,13 +34,12 @@ def _merge_flag_states(states):
 
     CMP/TEST save their operands into function-local _fa/_fb/_fas/_fbs at
     runtime. A shared consumer can use whichever predecessor executed. Keep
-    the operation equal; arithmetic states still reconstruct operands and
-    cannot use this merge.
+    the operation and width equal for that.
 
-    Widths may differ. The snapshot is already masked and sign-extended at
-    each compare's own width, so most conditions read the same either way;
-    the merged state keeps one operand list per width and _make_condition
-    answers only where they agree. DOA3's "is this fighter in move list N"
+    Any other disagreement -- another operation, another width -- becomes a
+    JOINED state listing each distinct predecessor state. _make_condition
+    answers it with each setter's own condition, chosen at run time by the
+    tag the setter leaves in _fk. DOA3's "is this fighter in move list N"
     check reaches its jne from a `cmp al, 1` and a `cmp ecx, eax`; refusing
     the merge left the branch on the dead _flags, the check always said yes,
     and the stage wall clamp skipped both fighters every frame.
@@ -50,48 +49,18 @@ def _merge_flag_states(states):
     first = states[0]
     if all(state == first for state in states[1:]):
         return first
-    if first[0] in ("cmp", "test") and len(first[1]) == 2:
-        by_width = {}
-        for kind, ops in states:
-            if kind != first[0] or len(ops) != 2:
-                return None
-            by_width.setdefault(
-                _operand_width(ops[0]) or _operand_width(ops[1]), ops)
-        if len(by_width) == 1:
+    if first[0] in ("cmp", "test") and all(
+            kind == first[0] and len(ops) == 2 for kind, ops in states):
+        widths = {_operand_width(ops[0]) or _operand_width(ops[1])
+                  for _, ops in states}
+        if len(widths) == 1:
             return first
-        return (MIXED_WIDTH + first[0], list(by_width.values()))
-    return _merge_zero_flag(states)
-
-
-def _merge_zero_flag(states):
-    """Predecessors that disagree on the operation but not on the zero flag.
-
-    `sub eax, ecx` reaching a loop head by fall-through and `dec eax` reaching
-    it by the back edge are different setters, so the state cannot be
-    inherited as itself -- yet both leave ZF as (eax == 0), which is the whole
-    of what a je or jne there is asking.
-
-    Unlike the CMP/TEST merge above, these reconstruct their operands rather
-    than reading a snapshot, so the merge only survives when every predecessor
-    names the same destination register. The name carries the width, so
-    `dec al` and `sub eax, ecx` do not merge.
-
-    The marker is deliberately narrow: only ZF is answerable from it, and
-    _make_condition refuses everything else.
-    """
-    from .lifter import ZF_FROM_DEST
-    dests = set()
-    for setter, ops in states:
-        if setter not in ZF_FROM_DEST or not ops:
-            return None
-        op = ops[0]
-        # disasm.Operand, not a capstone operand: .type is the string "reg".
-        if getattr(op, "type", None) != "reg" or not op.reg:
-            return None
-        dests.add(op.reg)
-    if len(dests) != 1:
-        return None
-    return ("__zf_from_dest", [states[0][1][0]])
+    members = []
+    for state in states:
+        for member in (state[1] if state[0] == JOINED else [state]):
+            if member not in members:
+                members.append(member)
+    return (JOINED, members)
 
 
 def _incoming_flag_state(sources, known, is_entry):
@@ -397,6 +366,9 @@ class FunctionTranslator:
         self.owned_function_starts = set()
         self.recovered_function_starts = set()
         self.coalesced_function_starts = set()
+        # Functions with a join of different flag states; translated a second
+        # time with every setter writing _fk (see translate_function).
+        self._flag_tag_functions = set()
         self.protected_function_starts = set()
         self.jump_table_entry_starts = set()
         self._recovered_cfg = {}
@@ -2241,6 +2213,8 @@ class FunctionTranslator:
 
         name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
         size = end - start
+        unimplemented_at_entry = {k: len(v) for k, v in self.lifter.unimplemented.items()}
+        flag_tags = start in self._flag_tag_functions
         instructions, blocks = self.decode_function(start, end)
         if not blocks:
             return None
@@ -2450,6 +2424,8 @@ class FunctionTranslator:
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
+        if flag_tags:
+            lines.append("    uint32_t _fk = 0; /* tag of the last flag setter */")
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch
@@ -2498,7 +2474,8 @@ class FunctionTranslator:
         # reads is the lifter's tracking rule, mirrored here so only the
         # functions that consume CF declare it: computing it beside every add
         # in the image would be a line per add in 48,000 functions.
-        has_carry = self._function_needs_cf(instructions)
+        # A tagged join may pick a carry condition this scan cannot see.
+        has_carry = self._function_needs_cf(instructions) or flag_tags
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
         # Only functions that consume CF pay for producing it: an adc/sbb
@@ -2506,6 +2483,7 @@ class FunctionTranslator:
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
         # idiom MSVC emits for odd trailing elements.
         self.lifter.needs_cf = has_carry
+        self.lifter.flag_tags = flag_tags
         self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
 
         # SSE and MMX are architectural state, declared globally by the
@@ -2723,6 +2701,17 @@ class FunctionTranslator:
 
         lines.append(f"}}")
         lines.append(f"")
+
+        # A join of different flag states reads the tag of whichever setter
+        # ran (_make_condition). Only now is it known that this function has
+        # one, so translate it again with every setter writing _fk.
+        if not flag_tags and any("_fk ==" in line for line in lines):
+            for mnemonic, count in unimplemented_at_entry.items():
+                del self.lifter.unimplemented[mnemonic][count:]
+            for mnemonic in set(self.lifter.unimplemented) - set(unimplemented_at_entry):
+                del self.lifter.unimplemented[mnemonic]
+            self._flag_tag_functions.add(start)
+            return self.translate_function(func_addr, func_info)
 
         return "\n".join(lines)
 

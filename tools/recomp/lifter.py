@@ -17,6 +17,7 @@ Memory model:
 import os
 import re
 import struct
+import zlib
 
 from .disasm import Instruction, Operand, LOOP_JUMPS
 from .config import is_code_address, is_data_address, va_to_file_offset
@@ -375,18 +376,26 @@ CF_TRACKED = frozenset({
 # separately and _function_needs_cf treats them as CF producers.
 BT_MODIFY = frozenset({"bts", "btr", "btc"})
 
-# Arithmetic that writes its destination and leaves ZF as (destination == 0).
-# A join can unify two different setters from this set when they share a
-# destination register, because a je or jne then means the same thing on both
-# edges. cmp and test are deliberately absent: they write no destination.
-ZF_FROM_DEST = frozenset({
-    "sub", "add", "and", "or", "xor", "inc", "dec", "neg",
-    "adc", "sbb", "shl", "shr", "sar",
-})
+# Flag setter of a join whose predecessors set the flags differently --
+# another operation, or the same one at another width; flag_ops lists each
+# distinct (setter, ops) state. See translator._merge_flag_states.
+JOINED = "__joined"
 
-# Flag-setter prefix for a join of same-kind cmp/test snapshots taken at
-# different operand widths; see translator._merge_flag_states.
-MIXED_WIDTH = "__mixed_width_"
+
+def flag_state_tag(setter, ops):
+    """The constant a setter leaves in _fk when Lifter.flag_tags is on.
+
+    Equal states give equal conditions, so a hash of the state is enough:
+    the setter and the join that reads it compute the same value."""
+    return zlib.crc32(repr((setter, ops)).encode())
+
+
+FLAG_TAG_NOTE = "/* flag setter tag */"
+
+
+def _flag_tag_stmt(setter, ops):
+    return f"_fk = 0x{flag_state_tag(setter, ops):08X}u; {FLAG_TAG_NOTE}"
+
 
 # Additional instructions that modify EFLAGS (tracked but handled as generic)
 _EFLAGS_SETTERS = frozenset({
@@ -515,34 +524,25 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
     cmp_macro, test_macro, desc = cond_info
 
-    # A join of cmp (or test) snapshots taken at different widths: flag_ops
-    # holds one operand list per width. A condition whose text is the same
-    # for every width reads only the width-normalised snapshot and holds on
-    # every path; one that differs (js/jns pick their sign bit by width)
-    # keeps the fallback.
-    if flag_setter.startswith(MIXED_WIDTH):
-        kind = flag_setter[len(MIXED_WIDTH):]
-        answers = {_make_condition(jcc, kind, ops) for ops in flag_ops}
-        return answers.pop() if len(answers) == 1 else None
-
-    # A join whose predecessors disagree on which instruction set the flags,
-    # but agree that the zero flag came from the same destination register.
-    #
-    # "sub eax, ecx" on one edge and "dec eax" on the other are different
-    # setters, so the state cannot be inherited as itself -- yet both leave
-    # ZF as (eax == 0), which is all a je or jne needs. The translator
-    # recognises that case and passes this marker.
-    #
-    # Only ZF is answerable from it. dec does not write CF, so a jb after the
-    # same join would be reading a flag one predecessor never set; returning
-    # None there leaves the existing fallback in place.
-    if flag_setter == "__zf_from_dest" and flag_ops:
-        dest = _fmt_operand_read(flag_ops[0])
-        if jcc in ("je", "jz"):
-            return f"({dest} == 0)", desc
-        if jcc in ("jne", "jnz"):
-            return f"({dest} != 0)", desc
-        return None
+    # A join of different flag states. Text that is the same for every state
+    # reads only what each setter snapshotted and holds on every path. Where
+    # it differs -- a sign bit taken at another width, or another operation
+    # -- each path's last setter also left its tag in _fk, and the condition
+    # picks that setter's own expression at run time.
+    if flag_setter == JOINED:
+        answers = {}
+        for setter, ops in flag_ops:
+            answer = _make_condition(jcc, setter, ops)
+            if answer is None:
+                return None
+            answers[flag_state_tag(setter, ops)] = answer[0]
+        texts = set(answers.values())
+        if len(texts) == 1:
+            return texts.pop(), desc
+        *rest, (_, expr) = answers.items()
+        for tag, text in reversed(rest):
+            expr = f"(_fk == 0x{tag:08X}u ? ({text}) : {expr})"
+        return expr, desc
 
     # A cmp/test that is not fused with its jcc snapshots its operands into
     # _fa/_fb (zero-extended) and _fas/_fbs (sign-extended) at the point the
@@ -1369,6 +1369,9 @@ class Lifter:
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
+        # Set per-function by translator: every flag setter also writes _fk,
+        # for joins whose predecessors set the flags differently.
+        self.flag_tags = False
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
         self.force_return_value = None   # Set per-function by --force-return
@@ -3948,6 +3951,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
             if flag_insn.mnemonic in ("cmp", "test") and len(flag_insn.operands) >= 2:
                 stmts.extend(lifter._snapshot_flags(
                     flag_insn, last_flag_ops, last_flag_setter))
+            if lifter.flag_tags:
+                stmts.append(_flag_tag_stmt(last_flag_setter, last_flag_ops))
             stmts.append(stmt)
             i += consumed
             continue
@@ -4078,6 +4083,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
         stmts.extend(results)
 
         # Track flag-setting instructions
+        state_before = last_flag_ops
         if (curr.mnemonic in _BARE_STRING_COMPARES
                 and not _has_xmm_operand(curr.operands)):
             # A single cmps/scas sets the flags like cmp. "cmpsd" is also
@@ -4138,6 +4144,11 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # Unknown instruction - conservatively clear flag state
             last_flag_setter = None
             last_flag_ops = []
+
+        # Every setter assigns a fresh operand list, so identity says whether
+        # this instruction took over the flags.
+        if lifter.flag_tags and last_flag_setter and last_flag_ops is not state_before:
+            stmts.append(_flag_tag_stmt(last_flag_setter, last_flag_ops))
 
         i += 1
 

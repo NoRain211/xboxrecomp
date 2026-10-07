@@ -25,8 +25,9 @@ until it left mapped memory, taking the process with it. Settling the flag
 state to a fixed point before emitting gives the jcc its comparison back.
 
 The second property matters as much: when the predecessors genuinely
-disagree, the fallback must stay. Inheriting the wrong flags is worse than
-inheriting none, because the branch then looks right and goes the wrong way.
+disagree, neither one's flags may be inherited -- the branch would look right
+and go the wrong way. Each setter instead leaves its tag in _fk, and the jcc
+evaluates the condition of whichever one ran.
 """
 
 import os
@@ -67,24 +68,25 @@ def test_loop_head_inherits_flags_from_both_predecessors():
     assert "CMP_EQ" in code or "== 0" in code, code
 
 
-def test_disagreeing_predecessors_keep_the_fallback():
-    # Two predecessors reach the jz: one after `sub`, one after `inc`, whose
-    # flags come from a different operand. The join must refuse.
+def test_disagreeing_predecessors_pick_their_own_flags():
+    # Two predecessors reach the jl: one after `sub`, one after `inc`, whose
+    # OF comes from a different rule. Neither may stand for the other.
     #   +0  sub eax, ecx
-    #   +2  jmp +3            -> the jz at +5
-    #   +4  inc edx           (falls through to the jz, different flag source)
-    #   +5 L: jz +1
+    #   +2  jmp +3            -> the jl at +5
+    #   +4  inc edx           (falls through to the jl, different flag source)
+    #   +5 L: jl +0
     #   +7  ret
     image = (b"\x29\xC8"          # sub eax, ecx
              b"\xEB\x01"          # jmp +1 -> +5
              b"\x42"              # inc edx
-             b"\x74\x00"          # jz +0 -> +7
+             b"\x7C\x00"          # jl +0 -> +7
              b"\xC3")             # ret
     code = _translate(image)
-    assert "_flags /*" in code, code
+    assert "_flags /*" not in code, code
+    assert "(_fk == 0x" in code, code
 
 
 if __name__ == "__main__":
     test_loop_head_inherits_flags_from_both_predecessors()
-    test_disagreeing_predecessors_keep_the_fallback()
+    test_disagreeing_predecessors_pick_their_own_flags()
     print("ok")

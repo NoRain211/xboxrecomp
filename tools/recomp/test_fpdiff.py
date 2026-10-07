@@ -36,6 +36,8 @@ CASES = (
     "int_or8_j", "int_xor16_j", "int_adc8_j", "int_sbb32_j", "int_neg8_j",
     "int_neg32_j", "int_shr_18_j", "int_sar_116_j", "int_imul16_j",
     "int_imul32_j", "int_sub32_clobber_j",
+    # Joins of paths that set the flags differently.
+    "join_",
 )
 
 
