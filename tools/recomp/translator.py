@@ -13,6 +13,7 @@ Produces compilable C code using recomp_types.h macros.
 
 import bisect
 import json
+import glob
 import os
 import struct
 import sys
@@ -20,9 +21,100 @@ import sys
 # Import the functions, not the VA constants: configure_from_xbe() rebinds those
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
+from . import config as _config
 from .disasm import Disassembler
-from .lifter import (Lifter, carry_crosses_blocks, lift_basic_block,
-                     detect_seh_helpers)
+from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
+                     _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
+                     detect_setjmp_helpers, _func_ident, _operand_width)
+
+
+def _merge_flag_states(states):
+    """Merge comparable snapshots without requiring identical source operands.
+
+    CMP/TEST save their operands into function-local _fa/_fb/_fas/_fbs at
+    runtime. A shared consumer can use whichever predecessor executed. Keep
+    operation and width equal because sign/parity handling depends on them;
+    arithmetic states still reconstruct operands and cannot use this merge.
+    """
+    if not states or any(not state or not state[0] for state in states):
+        return None
+    first = states[0]
+    if all(state == first for state in states[1:]):
+        return first
+    if first[0] in ("cmp", "test") and len(first[1]) == 2:
+        width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+        for kind, ops in states[1:]:
+            if kind != first[0] or len(ops) != 2:
+                return None
+            if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
+                return None
+        return first
+    return _merge_zero_flag(states)
+
+
+def _merge_zero_flag(states):
+    """Predecessors that disagree on the operation but not on the zero flag.
+
+    `sub eax, ecx` reaching a loop head by fall-through and `dec eax` reaching
+    it by the back edge are different setters, so the state cannot be
+    inherited as itself -- yet both leave ZF as (eax == 0), which is the whole
+    of what a je or jne there is asking.
+
+    Unlike the CMP/TEST merge above, these reconstruct their operands rather
+    than reading a snapshot, so the merge only survives when every predecessor
+    names the same destination register. The name carries the width, so
+    `dec al` and `sub eax, ecx` do not merge.
+
+    The marker is deliberately narrow: only ZF is answerable from it, and
+    _make_condition refuses everything else.
+    """
+    from .lifter import ZF_FROM_DEST
+    dests = set()
+    for setter, ops in states:
+        if setter not in ZF_FROM_DEST or not ops:
+            return None
+        op = ops[0]
+        # disasm.Operand, not a capstone operand: .type is the string "reg".
+        if getattr(op, "type", None) != "reg" or not op.reg:
+            return None
+        dests.add(op.reg)
+    if len(dests) != 1:
+        return None
+    return ("__zf_from_dest", [states[0][1][0]])
+
+
+def _incoming_flag_state(sources, known, is_entry):
+    """The flag state a block inherits, or None when it cannot be known.
+
+    A predecessor with no computed state yet makes the result unknown rather
+    than guessed: that costs a fallback condition and never a wrong one.
+    """
+    if is_entry or not sources:
+        return None
+    if not all(p in known for p in sources):
+        return None
+    return _merge_flag_states([known[p] for p in sources])
+
+
+def write_if_changed(path, text):
+    """Write text to path only when it differs from what is already there.
+
+    Every regen rewrites all 54 chunks of generated C. If the bytes are
+    identical the mtime bump still forces the compiler to redo the whole
+    365 MB at /O2, which is minutes of a saturated box for a one-function
+    change. Comparing first makes an unchanged chunk free.
+
+    Returns True if the file was written.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return True
 
 
 def _fixup_icall_esp_save(lines):
@@ -34,13 +126,37 @@ def _fixup_icall_esp_save(lines):
 
     Scans backwards from each RECOMP_ICALL_SAFE line to find consecutive
     PUSH32 lines (the arg pushes), then inserts a save before the first.
+
+    A push of a callee-saved register can be either the function saving it or
+    an argument that happens to live in it, and the two need telling apart:
+    absorbing a save makes the failure path rewind g_esp over the function's
+    own frame, and the epilogue then pops its registers from too high -- silent
+    caller corruption. Leaving an argument behind is the mirror image, and
+    shifts the epilogue the other way.
+
+    Push and pop counts separate them. A register popped at least as often as
+    it is pushed is restored on every path out, so a push of it is a save and
+    the argument run ends there -- "at least", not "exactly", because a
+    function with several epilogues pops once per return path. A register
+    pushed more often than it is popped has a push nobody restores -- an
+    argument -- and the run absorbs it as before.
+
+    Where that is still ambiguous, stopping early is the safer error: it
+    under-rewinds, which surfaces as the detectable "epilogue never ran" leak,
+    rather than as a caller silently carrying a wrong register.
     """
     import re
+    saves = tuple(
+        "PUSH32(esp, %s)" % reg
+        for reg in ("ebx", "esi", "edi", "ebp")
+        if 0 < sum("PUSH32(esp, %s)" % reg in line for line in lines)
+        <= sum("POP32(esp, %s)" % reg in line for line in lines)
+    )
     result = []
     # Find indices of all ICALL_SAFE lines
     icall_indices = []
     for i, line in enumerate(lines):
-        if 'RECOMP_ICALL_SAFE(' in line:
+        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
             icall_indices.append(i)
 
     if not icall_indices:
@@ -49,7 +165,7 @@ def _fixup_icall_esp_save(lines):
     # For each ICALL, determine where to insert the save
     insert_before = set()  # map: line_index → True (insert save before this line)
     for icall_idx in icall_indices:
-        # The ICALL line itself contains "PUSH32(esp, 0); RECOMP_ICALL_SAFE(...)"
+        # The ICALL line itself is "PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...)"
         # Look backwards for consecutive lines containing PUSH32(esp,
         first_push_idx = icall_idx
         j = icall_idx - 1
@@ -59,6 +175,18 @@ def _fixup_icall_esp_save(lines):
             if not stripped:
                 j -= 1
                 continue
+            # A completed direct call ends the argument run, and must be tested
+            # before the generic PUSH32 check below: a direct call is emitted as
+            # "PUSH32(esp, <retva>); name();" on one line, so it also looks like
+            # an argument push. Treating it as one put the _icall_esp save
+            # *before* the direct call, and an ICALL that then failed rewound
+            # g_esp over a call that had already returned.
+            if '/* call 0x' in stripped:
+                break
+            # A saved callee-saved register belongs to this function's frame,
+            # not to the call's arguments; the run ends here.
+            if any(stripped.startswith(save) for save in saves):
+                break
             # Check if this is a PUSH32 line (arg push)
             if stripped.startswith('PUSH32(esp,'):
                 first_push_idx = j
@@ -73,8 +201,7 @@ def _fixup_icall_esp_save(lines):
                 'RECOMP_ICALL' in stripped or
                 'return;' in stripped or
                 stripped.startswith('if (') or
-                stripped.startswith('POP32(') or
-                stripped.startswith('PUSH32(esp, 0); sub_')):
+                stripped.startswith('POP32(')):
                 break
             # It's an interleaved computation - skip past it
             j -= 1
@@ -89,11 +216,98 @@ def _fixup_icall_esp_save(lines):
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}{{ uint32_t _icall_esp = g_esp;")
         result.append(line)
-        if 'RECOMP_ICALL_SAFE(' in line:
+        if 'RECOMP_ICALL_SAFE(' in line or 'RECOMP_ICALL_SAFE_AT(' in line:
             indent = line[:len(line) - len(line.lstrip())]
             result.append(f"{indent}}}")
 
     return result
+
+
+# The x87 stack accessors the lifter's output is written against. Module-level
+# so tools/conformance emits byte-identical macros: a harness with its own copy
+# would still pass after these changed, which is the dangerous direction.
+FP_STACK_MACROS = [
+    "    #define fp_push(v) do { double _fp_value = (v); \\",
+    "        g_fp_top = (g_fp_top + 7u) & 7u; \\",
+    "        g_fp_stack[g_fp_top] = _fp_value; } while (0)",
+    "    #define fp_pop() (g_fp_top = (g_fp_top + 1u) & 7u)",
+    "    #define fp_top() g_fp_stack[g_fp_top]",
+    "    #define fp_st(i) g_fp_stack[(g_fp_top + (i)) & 7u]",
+    "    #define fp_st1() fp_st(1)",
+]
+
+FP_STACK_UNDEFS = [
+    "    #undef fp_push",
+    "    #undef fp_pop",
+    "    #undef fp_top",
+    "    #undef fp_st",
+    "    #undef fp_st1",
+]
+
+
+
+def xbe_title(xbe_data, xbe_path):
+    """Human-readable title for generated-file banners.
+
+    Read from the XBE certificate so the output names the game it came from.
+    These banners used to be hardcoded to "Burnout 3: Takedown" -- the toolkit
+    grew out of that title -- so every other game's generated C claimed to be
+    Burnout 3. Falls back to the file's basename if the certificate cannot be
+    read; a banner is cosmetic and must never fail a build.
+    """
+    try:
+        base = struct.unpack_from("<I", xbe_data, 0x104)[0]
+        cert_va = struct.unpack_from("<I", xbe_data, 0x118)[0]
+        off = cert_va - base + 0x0C
+        name = xbe_data[off:off + 80].decode("utf-16-le").partition(chr(0))[0].strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    return os.path.splitext(os.path.basename(xbe_path))[0]
+
+
+def _seh_prologs_of(lifter):
+    """Every __SEH_prolog address a lifter knows about, as a set.
+
+    Reads SEH_PROLOGS when present and falls back to the scalar SEH_PROLOG,
+    so a lifter stub that only sets the old attribute still works -- the test
+    suite builds exactly such a stub, and so may callers outside this repo.
+    """
+    prologs = getattr(lifter, "SEH_PROLOGS", None)
+    if prologs:
+        return set(prologs)
+    one = getattr(lifter, "SEH_PROLOG", None)
+    return {one} if one is not None else set()
+
+
+def load_coalescences(path):
+    """Read explicit, title-local owner bounds; never guess omitted starts."""
+    with open(path, encoding="utf-8") as stream:
+        entries = json.load(stream)
+    fields = {"start", "end", "coalesce_starts"}
+
+    def address(value):
+        if not isinstance(value, str) or not value.startswith("0x"):
+            raise ValueError(f"{path}: expected a hexadecimal address string")
+        number = int(value, 16)
+        if not 0 <= number <= 0xFFFFFFFF:
+            raise ValueError(f"{path}: address is outside the 32-bit range")
+        return number
+
+    if not isinstance(entries, list):
+        raise ValueError(f"{path}: expected an array of coalescence entries")
+    parsed = []
+    for entry in entries:
+        if (not isinstance(entry, dict) or set(entry) != fields
+                or not isinstance(entry["coalesce_starts"], list)):
+            raise ValueError(f"{path}: expected start, end and coalesce_starts")
+        parsed.append({
+            "start": address(entry["start"]),
+            "end": address(entry["end"]),
+            "coalesce_starts": [address(item) for item in entry["coalesce_starts"]],
+        })
+    return parsed
 
 
 # Instructions that read or define EFLAGS, for checking what a recovered
@@ -109,14 +323,47 @@ _FLAG_WRITERS = frozenset({
 })
 
 
+
+def load_label_db(labels_json_path):
+    """addr -> name from labels.json, for naming call targets and functions.
+
+    String-reference labels are left out. They name data (str_<text>), the
+    same text at two addresses gets the same name, and a function recovered
+    at such an address -- data that decodes and ends in a ret -- was emitted
+    twice under one name: Steel Battalion's two "MAIN_L" strings gave two
+    `void str_MAIN_L(void)` bodies and the build stopped at C2084. Such a
+    target falls back to sub_XXXXXXXX, which is unique by construction.
+    """
+    label_db = {}
+    if labels_json_path and os.path.exists(labels_json_path):
+        with open(labels_json_path, "r") as f:
+            labels = json.load(f)
+        for lbl in labels:
+            if lbl.get("type") == "string_ref":
+                continue
+            label_db[int(lbl["address"], 16)] = lbl["name"]
+    return label_db
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
+    STRONG_ENTRY_METHODS = frozenset({
+        "entry_point", "call_target", "indirect_call_slot",
+        "seed_vtable_thunk", "static_indirect_table",
+        "prologue", "prologue_alt",
+        "tail_jump_target", "tail_jump_alias",
+        "imm_ref_target", "data_ptr_target",
+        "external_coalescence",
+    })
+
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
-                 abi_db=None, manual_call_targets=None,
-                 seh_prolog=None, seh_epilog=None):
+                 abi_db=None, seh_prolog=None, seh_epilog=None,
+                 setjmp_fn=None, longjmp_fn=None,
+                 trace_functions=None, force_returns=None, icall_sites=None):
         """
         xbe_data: bytes - raw XBE file contents
+        icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
+                     that site reach (tools.recomp.icall_feedback merge)
         func_db: dict - addr → function info from functions.json
         label_db: dict - addr → name from labels.json
         classification_db: dict - addr → classification from identified_functions.json
@@ -125,47 +372,68 @@ class FunctionTranslator:
         """
         self.xbe_data = xbe_data
         self.func_db = func_db
+        self.icall_sites = dict(icall_sites or {})
         self.label_db = label_db or {}
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
+        self.trace_functions = set(trace_functions or ())
+        self.force_returns = dict(force_returns or {})
         self.disasm = Disassembler()
-        self.lifter = Lifter(
-            func_db=func_db,
-            label_db=label_db,
-            abi_db=abi_db,
-            xbe_data=xbe_data,
-            manual_call_targets=manual_call_targets,
-            seh_prolog=seh_prolog,
-            seh_epilog=seh_epilog)
+        self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
+                             xbe_data=xbe_data, seh_prolog=seh_prolog,
+                             setjmp_fn=setjmp_fn, longjmp_fn=longjmp_fn,
+                             seh_epilog=seh_epilog)
         self.owned_function_starts = set()
         self.recovered_function_starts = set()
-        self.extended_function_starts = set()
         self.coalesced_function_starts = set()
+        self.protected_function_starts = set()
         self.jump_table_entry_starts = set()
         self._recovered_cfg = {}
         self._ownership_ready = False
-        self.translated_function_starts = set()
 
-    def discover_static_indirect_targets(self):
+    def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover function entries from bounded static callback tables."""
         original_starts = sorted(self.func_db)
         recovered_callers = {}
 
         for caller, func_info in list(self.func_db.items()):
             end = func_info.get("end", caller)
-            raw_bytes = self._read_func_bytes(caller, end)
-            if not raw_bytes:
-                continue
-            instructions = self.disasm.disassemble_function(
-                raw_bytes, caller, end)
+            recovered = self._recovered_cfg.get(caller)
+            if recovered and recovered.get("instructions"):
+                end = recovered.get("end", end)
+                instructions = recovered["instructions"]
+            else:
+                raw_bytes = self._read_func_bytes(caller, end)
+                if not raw_bytes:
+                    continue
+                instructions = self.disasm.disassemble_function(
+                    raw_bytes, caller, end)
             for lower, upper in self._find_static_indirect_ranges(instructions):
                 targets = self._read_static_callback_table(
                     lower, upper, original_starts)
                 if targets is None:
                     continue
                 for target in targets:
-                    if target not in self.func_db:
-                        recovered_callers.setdefault(target, set()).add(caller)
+                    if target in self.func_db:
+                        if coalescing:
+                            callers = {
+                                int(value, 16) if isinstance(value, str) else value
+                                for value in self.func_db[target].get("called_by") or []
+                            }
+                            callers.add(caller)
+                            self.func_db[target]["called_by"] = [
+                                f"0x{value:08X}" for value in sorted(callers)]
+                        continue
+                    if coalescing:
+                        index = bisect.bisect_right(original_starts, target)
+                        if index:
+                            owner = original_starts[index - 1]
+                            if (owner in self.coalesced_function_starts
+                                    and target < self.func_db[owner]["end"]):
+                                raise ValueError(
+                                    f"Static callback 0x{target:08X} lies inside "
+                                    f"coalesced function 0x{owner:08X}")
+                    recovered_callers.setdefault(target, set()).add(caller)
 
         for target, callers in sorted(recovered_callers.items()):
             next_index = bisect.bisect_right(original_starts, target)
@@ -206,122 +474,55 @@ class FunctionTranslator:
 
         return self.recovered_function_starts
 
-    def adopt_external_functions(self, entries):
-        """Recover function entries supplied with externally analyzed bounds.
-
-        Applies the same containment and section validation as the static
-        callback recovery. The caller supplies the exact end, so adjacent
-        recovered entries cannot overlap each other the way an inferred
-        next-start boundary would, and the body need not contain a ret:
-        tail calls and computed-jump tails are accepted because the external
-        analysis already established where the function ends.
-        """
-        for entry in sorted(entries, key=lambda e: e["start"]):
-            target = entry["start"]
-            end = entry["end"]
-            coalesce_starts = entry.get("coalesce_starts")
-            if coalesce_starts is not None:
-                self._coalesce_detected_function(
-                    target, end, coalesce_starts,
-                    entry.get("coalesce_bridges", []))
-                continue
-            if end <= target:
-                continue
-            if target in self.func_db:
-                self._extend_detected_function(target, end)
-                continue
-
-            original_starts = sorted(self.func_db)
-            index = bisect.bisect_right(original_starts, target)
-            if index == 0 or index >= len(original_starts):
-                continue
-            previous = self.func_db[original_starts[index - 1]]
-            if previous.get("end", previous["_addr"]) > target:
-                continue
-            if end > original_starts[index]:
-                continue
-            section = self.func_db[original_starts[index]].get("section", "")
-            if section in (".rdata", ".data"):
-                continue
-
-            raw_bytes = self._read_func_bytes(target, end)
-            if not raw_bytes:
-                continue
-            instructions = self.disasm.disassemble_function(
-                raw_bytes, target, end)
-            if not instructions:
-                continue
-
-            self.func_db[target] = {
-                "_addr": target,
-                "start": f"0x{target:08X}",
-                "end": end,
-                "size": end - target,
-                "name": self.label_db.get(target, f"sub_{target:08X}"),
-                "section": section,
-                "confidence": 0.9,
-                "detection_method": "external_boundary",
-                "num_instructions": len(instructions),
-                "has_prologue": self._func_has_prologue(instructions),
-                "calls_to": [],
-                "called_by": [],
-            }
-            self.recovered_function_starts.add(target)
-
-        return self.recovered_function_starts
-
-    def _coalesce_detected_function(
-            self, target, end, expected_starts, bridge_starts):
+    def coalesce_function(self, target, end, expected_starts):
         """Merge an explicitly named set of false interior function starts.
 
-        Some detector seed sets split one real loop at each branch target.
-        Generated cross-fragment back-edges then recurse on the host stack.
-        Coalescence is deliberately explicit and fail-closed: the recovery
-        entry must name every current interior start, none may have independent
-        entry evidence, every fragment must end within the requested extent,
-        and the decoded CFG must tile that extent. Unlike a skipped disjoint
-        recovery, any mismatch rejects the whole recovery batch.
+        A false split can lose flags or turn a back-edge into host recursion.
+        Require the exact interior-start census, no independent entry evidence,
+        and a decoded CFG covering the requested extent without gaps. Reject
+        mismatches before changing any function metadata.
         """
         def reject(reason):
             raise ValueError(
                 f"Invalid recovery coalescence "
                 f"0x{target:08X}->0x{end:08X}: {reason}")
 
+        if self._ownership_ready:
+            reject("coalesce before discovering CFG ownership")
         if target not in self.func_db:
             reject("start is not a detected function")
         if end <= target:
             reject("end does not follow start")
+
+        if self.func_db[target].get("end", target) > end:
+            reject("requested end shrinks the existing owner")
+        if any(start < target and info.get("end", start) > target
+               for start, info in self.func_db.items()):
+            reject("preceding function overlaps the requested owner")
+        sections = [section for section in _config._SECTIONS
+                    if section.is_code and section.va <= target
+                    and end <= section.va + section.va_size
+                    and end <= section.va + section.raw_size]
+        if not sections:
+            reject("extent is not backed by one code section")
 
         expected = list(expected_starts)
         if (not expected or expected != sorted(set(expected))
                 or any(start <= target or start >= end
                        for start in expected)):
             reject("coalesce_starts must be sorted unique interior starts")
-        bridges = list(bridge_starts)
-        if (bridges != sorted(set(bridges))
-                or any(start <= target or start >= end
-                       for start in bridges)):
-            reject("coalesce_bridges must be sorted unique interior starts")
-        if any(start in self.func_db for start in bridges):
-            reject("coalesce bridge is already a detected function start")
-
         actual = sorted(
             start for start in self.func_db if target < start < end)
         if actual != expected:
             formatted = ", ".join(f"0x{start:08X}" for start in actual)
             reject(f"current interior starts are [{formatted}]")
-        # Seed-derived fragments are not independent evidence. The legacy
-        # authenticated bounds file and the standalone detector both record
-        # strong-entry fields on addresses that are mid-function branch
-        # targets: 0x000985BD is reached only by a conditional jump from
-        # inside 0x00098570, yet the adopted input marks it external_entry.
-        # The seed set is exactly what coalescence is allowed to correct,
-        # so coalesce ignores those fields for such fragments.
-        strong = [
-            start for start in actual
-            if self._is_strong_entry(self.func_db[start])
-            and not self.func_db[start].get("seed_derived")
-        ]
+        protected = [start for start in actual
+                     if start in self.protected_function_starts]
+        if protected:
+            reject(
+                f"interior start 0x{protected[0]:08X} is protected by manual code")
+        strong = [start for start in actual
+                  if self._is_strong_entry(self.func_db[start], start)]
         if strong:
             reject(
                 f"interior start 0x{strong[0]:08X} has independent evidence")
@@ -332,56 +533,73 @@ class FunctionTranslator:
         if overruns:
             reject(f"interior function 0x{overruns[0]:08X} crosses end")
 
-        # A bridge exists only to re-enter the decode after an alignment gap
-        # that no direct edge reaches. Prove each one really is that gap:
-        # a single wide no-op padding exactly up to a named false start.
-        # Unchecked, a bridge could name any interior address and make an
-        # otherwise unprovable extent appear to tile.
-        for bridge in bridges:
-            raw_gap = self._read_func_bytes(bridge, end)
-            decoded = (
-                self.disasm.disassemble_function(raw_gap, bridge, end)
-                if raw_gap else None)
-            if not decoded or not self._is_multi_byte_nop(decoded[0]):
-                reject(f"bridge 0x{bridge:08X} is not a multi-byte no-op")
-            if decoded[0].end_address not in expected:
-                reject(
-                    f"bridge 0x{bridge:08X} pads to "
-                    f"0x{decoded[0].end_address:08X}, not a coalesced start")
-
         # Decode through the gap before the next detected function. A local
         # jump table may begin exactly at ``end``; its entries are analysis
         # input, not bytes owned by the coalesced function. The exact tiling
         # checks below still fail closed if decoded code reaches past ``end``.
         current_starts = sorted(self.func_db)
         next_index = bisect.bisect_left(current_starts, end)
-        analysis_end = (
-            current_starts[next_index]
-            if next_index < len(current_starts) else end)
+        analysis_end = min(sections[0].va + sections[0].raw_size,
+                           sections[0].va + sections[0].va_size)
+        if next_index < len(current_starts):
+            analysis_end = min(analysis_end, current_starts[next_index])
         recovered = self._recover_cfg(
-            target, analysis_end, set(bridges), set())
+            target, analysis_end, set(), set(), coalescing=True)
         if recovered is None:
             reject("could not decode CFG")
         instructions, jump_tables, _ = recovered
-        # MSVC aligns an interior branch target with a single wide no-op that
-        # no direct edge reaches, so the decode tiles up to the padding and
-        # resumes after it. Close such a gap automatically rather than making
-        # every caller name a bridge: the gap start is the tiler's own
-        # coverage stop, so unlike a caller-supplied bridge it cannot be a
-        # misaligned offset inside a real instruction, and the padding must be
-        # one no-op ending exactly where the decode resumes. The strict tiling
-        # checks below still fail closed on anything this does not cover.
+        # Padding can close coverage gaps, but must not become an executable
+        # predecessor that discards flags at the following real block.
         padding = self._alignment_padding_gaps(target, end, instructions)
-        if padding:
-            recovered = self._recover_cfg(
-                target, analysis_end, set(bridges) | padding, set())
-            if recovered is None:
-                reject("could not decode CFG")
-            instructions, jump_tables, _ = recovered
+        for lower, upper in self._find_static_indirect_ranges(instructions):
+            callbacks = self._read_static_callback_table(
+                lower, upper, current_starts)
+            if callbacks and any(target < callback < end for callback in callbacks):
+                reject("interior start is a callback from the requested owner")
+        if any(instruction.is_call and instruction.call_target in actual
+               for instruction in instructions):
+            reject("interior start is called from the requested owner")
+        if any(instruction.mnemonic == "jmp" and not instruction.jump_target
+               and instruction.operands
+               and instruction.operands[0].type == "mem"
+               and instruction.operands[0].mem_seg == "fs"
+               for instruction in instructions):
+            reject("segmented indirect jump cannot prove local ownership")
+        computed_jump_edges = self._computed_jump_edges(
+            instructions, target, end, jump_table_targets=jump_tables)
+        _, indirect_calls = self._indirect_code_refs(
+            instructions, target, end, proof_mode=True,
+            return_call_refs=True, computed_jump_edges=computed_jump_edges)
+        if indirect_calls.intersection(actual):
+            reject("interior start is called from the requested owner")
         if not instructions or instructions[0].address != target:
             reject("CFG does not start at the requested start")
         covered_end = target
         for instruction in instructions:
+            if covered_end in padding and instruction.address > covered_end:
+                covered_end = instruction.address
+            if instruction.address > covered_end:
+                gap = self._read_func_bytes(covered_end, instruction.address)
+                for table_va, targets in jump_tables.items():
+                    table = b"".join(struct.pack("<I", t) for t in targets)
+                    offset = gap.find(table) if gap is not None else -1
+                    while offset >= 0:
+                        table_start = covered_end + offset
+                        table_end = table_start + len(table)
+                        before = (table_start == covered_end
+                                  or self._is_alignment_padding_range(
+                                      covered_end, table_start))
+                        after = (table_end == instruction.address
+                                 or self._is_alignment_padding_range(
+                                     table_end, instruction.address))
+                        if (table_start <= table_va < table_end
+                                and (table_va - table_start) % 4 == 0
+                                and before and after):
+                            covered_end = instruction.address
+                            break
+                        offset = gap.find(table, offset + 1)
+                    if covered_end == instruction.address:
+                        break
             if instruction.address != covered_end:
                 reject(f"CFG gap at 0x{covered_end:08X}")
             if instruction.end_address > end:
@@ -401,7 +619,6 @@ class FunctionTranslator:
             self._recovered_cfg.pop(start, None)
             self.owned_function_starts.discard(start)
             self.recovered_function_starts.discard(start)
-            self.extended_function_starts.discard(start)
         existing["end"] = end
         existing["size"] = end - target
         existing["num_instructions"] = len(instructions)
@@ -424,186 +641,15 @@ class FunctionTranslator:
             f"({len(instructions)} instructions)",
             file=sys.stderr)
 
-    def _extend_detected_function(self, target, end):
-        """Extend one detected function whose end truncated its real body.
-
-        A computed-jump dispatch can be detected with an end at the first
-        table target, leaving the rest of the body unowned and its interior
-        labels unreachable. An explicit recovery entry that repeats the
-        detected start may push that end outward, but only when the extent
-        is proven: the request must stay inside the gap before the next
-        function, and the decoded CFG must tile the requested extent exactly.
-        An explicit extension names an exact extent, so anything unproven is
-        a bad input rather than a weak inference: it fails the batch closed.
-        Repeating the already detected bounds stays a benign no-op.
-        """
-        existing = self.func_db[target]
-        original_end = existing.get("end", target)
-
-        def reject(reason):
-            raise ValueError(
-                f"Invalid recovery extension 0x{target:08X}->0x{end:08X}: "
-                f"{reason}")
-
-        if end == original_end:
-            return
-        if end < original_end:
-            reject(
-                f"shrinks detected end 0x{original_end:08X}")
-
-        # Compare against current state so an entry adopted earlier in this
-        # same pass still counts as an owner.
-        current_starts = sorted(self.func_db)
-        index = bisect.bisect_right(current_starts, target)
-        if index >= len(current_starts):
-            reject("no following function to bound the extension")
-        next_start = current_starts[index]
-        if end > next_start:
-            reject(
-                f"crosses next function start 0x{next_start:08X}")
-
-        # No other function may already own the newly claimed bytes. An
-        # interior start is caught by the bound above; this catches an
-        # earlier function whose extent reaches into the extension.
-        overlapping = sorted(
-            other for other, info in self.func_db.items()
-            if other != target and other < end
-            and info.get("end", other) > original_end)
-        if overlapping:
-            reject(
-                f"overlaps detected function 0x{overlapping[0]:08X}")
-
-        # Decode across the whole gap before the next function: a dispatch's
-        # jump tables commonly sit just past the last instruction, and they
-        # must be readable to resolve the interior targets. Ownership is
-        # still limited to the requested extent, proven below.
-        recovered = self._recover_cfg(target, next_start, set(), set())
-        if recovered is None:
-            reject("could not decode CFG")
-        instructions, jump_tables, _ = recovered
-        if not instructions:
-            reject("no decoded instructions")
-
-        padding = self._alignment_padding_gaps(target, end, instructions)
-        if padding:
-            recovered = self._recover_cfg(target, next_start, padding, set())
-            if recovered is None:
-                reject("could not decode CFG")
-            instructions, jump_tables, _ = recovered
-
-        # The decoded CFG must tile the requested extent exactly: no gap, no
-        # instruction past the end. That is what proves the requested bytes
-        # are this function's body rather than adjacent data or padding.
-        if instructions[0].address != target:
-            reject("CFG does not start at the requested start")
-        beyond = [insn for insn in instructions if insn.end_address > end]
-        if beyond:
-            reject(
-                f"CFG reaches 0x{max(i.end_address for i in beyond):08X}, "
-                f"past the requested end")
-        covered_end = target
-        for insn in instructions:
-            if insn.address != covered_end:
-                reject(
-                    f"CFG gap at 0x{covered_end:08X}")
-            covered_end = insn.end_address
-        if covered_end != end:
-            reject(
-                f"CFG covers through 0x{covered_end:08X}, not the requested "
-                f"end")
-
-        existing["end"] = end
-        existing["size"] = end - target
-        existing["num_instructions"] = len(instructions)
-        existing["detection_method"] = "external_extension"
-        self._recovered_cfg[target] = {
-            "end": end,
-            "instructions": instructions,
-            "jump_tables": jump_tables,
-        }
-        self.extended_function_starts.add(target)
-        print(f"Extended detected function 0x{target:08X} from "
-              f"0x{original_end:08X} to 0x{end:08X} "
-              f"({len(instructions)} instructions)", file=sys.stderr)
-
-    @staticmethod
-    def _find_static_indirect_ranges(instructions, max_bytes=0x10000):
-        """Find immediate-backed ranges in functions that call a register."""
-        constants = {}
-        ranges = set()
-        has_indirect_call = False
-
-        for insn in instructions:
-            operands = insn.operands
-            if (insn.mnemonic == "mov" and len(operands) >= 2
-                    and operands[0].type == "reg"):
-                destination = operands[0].reg
-                source = operands[1]
-                if source.type == "imm":
-                    constants[destination] = source.imm
-                elif source.type == "reg" and source.reg in constants:
-                    constants[destination] = constants[source.reg]
-                else:
-                    constants.pop(destination, None)
-            elif (insn.mnemonic == "cmp" and len(operands) >= 2
-                    and operands[0].type == "reg"
-                    and operands[1].type == "reg"):
-                lower = constants.get(operands[0].reg)
-                upper = constants.get(operands[1].reg)
-                if (lower is not None and upper is not None
-                        and lower < upper and lower % 4 == 0
-                        and upper % 4 == 0 and upper - lower <= max_bytes):
-                    ranges.add((lower, upper))
-            elif (insn.is_call and insn.call_target is None
-                    and operands and operands[0].type == "reg"):
-                has_indirect_call = True
-
-        return sorted(ranges) if has_indirect_call else []
-
-    def _read_static_callback_table(self, lower, upper, original_starts):
-        """Validate and return a bounded table of static code pointers."""
-        targets = []
-        for entry_va in range(lower, upper, 4):
-            offset = va_to_file_offset(entry_va)
-            if offset is None or offset + 4 > len(self.xbe_data):
-                return None
-            target = struct.unpack_from('<I', self.xbe_data, offset)[0]
-            if target in (0, 0xFFFFFFFF):
-                continue
-
-            index = bisect.bisect_right(original_starts, target)
-            if index and self.func_db[original_starts[index - 1]].get(
-                    "end", original_starts[index - 1]) > target:
-                targets.append(target)
-                continue
-            if index == 0 or index >= len(original_starts):
-                return None
-            previous = self.func_db[original_starts[index - 1]]
-            following = self.func_db[original_starts[index]]
-            if (previous.get("section") != following.get("section")
-                    or following.get("section") in (".rdata", ".data")
-                    or va_to_file_offset(target) is None):
-                return None
-            targets.append(target)
-
-        return targets if targets else None
-
-    @staticmethod
-    def _is_strong_entry(func_info):
-        """Return whether an entry has evidence independent of seed recovery."""
-        return bool(
-            func_info.get("external_entry")
-            or func_info.get("has_prologue")
-            or func_info.get("called_by"))
-
     @staticmethod
     def _is_multi_byte_nop(instruction):
         """Return whether one instruction is wide alignment padding.
 
         An assembler aligns the next branch target with a single wide
         instruction that has no effect: an explicit multi-byte ``nop``, the
-        classic ``lea reg, [reg]`` form, or a register self-move. These forms
-        all appear in this XBE.
+        classic ``lea reg, [reg]`` form, which reloads a register with its
+        own address, or a register self-move such as MSVC's two-byte
+        ``mov edi, edi``.
         """
         if instruction.size < 2:
             return False
@@ -626,9 +672,8 @@ class FunctionTranslator:
         A decode gap is only treated as padding when the bytes at the coverage
         stop must start with a multi-byte no-op, contain only no-ops, and end
         precisely where the decode picks up again. Real unreached code fails
-        that test, so this cannot invent a body: it only re-seeds the walk
-        across padding the assembler inserted to align the following branch
-        target.
+        that test, so this cannot invent a body: it only identifies padding
+        the assembler inserted before an already reachable branch target.
         """
         covered = {}
         for instruction in instructions:
@@ -662,32 +707,96 @@ class FunctionTranslator:
             cursor = max(cursor, covered[address])
         return gaps
 
-    def recover_external_cfgs(self):
-        """Recover CFGs whose authenticated input records an exact count."""
-        for start, info in sorted(self.func_db.items()):
-            expected = info.get("external_cfg_instruction_count")
-            if expected is None:
+    def _is_alignment_padding_range(self, start, end):
+        """Return whether an exact byte range is proven alignment padding."""
+        raw = self._read_func_bytes(start, end)
+        if not raw:
+            return False
+        decoded = self.disasm.disassemble_function(raw, start, end)
+        if not decoded or not self._is_multi_byte_nop(decoded[0]):
+            return False
+        cursor = start
+        for instruction in decoded:
+            if (instruction.address != cursor or instruction.end_address > end
+                    or (instruction.mnemonic != "nop"
+                        and not self._is_multi_byte_nop(instruction))):
+                return False
+            cursor = instruction.end_address
+        return cursor == end
+
+    @staticmethod
+    def _find_static_indirect_ranges(instructions, max_bytes=0x10000):
+        """Find immediate-backed ranges in functions that call a register."""
+        constants = {}
+        ranges = set()
+        has_indirect_call = False
+
+        for insn in instructions:
+            operands = insn.operands
+            if (insn.mnemonic == "mov" and len(operands) >= 2
+                    and operands[0].type == "reg"):
+                destination = operands[0].reg
+                source = operands[1]
+                if source.type == "imm":
+                    constants[destination] = source.imm
+                elif source.type == "reg" and source.reg in constants:
+                    constants[destination] = constants[source.reg]
+                else:
+                    constants.pop(destination, None)
+            elif (insn.mnemonic == "cmp" and len(operands) >= 2
+                    and operands[0].type == "reg"
+                    and operands[1].type == "reg"):
+                lower = constants.get(operands[0].reg)
+                upper = constants.get(operands[1].reg)
+                if (lower is not None and upper is not None
+                        and lower < upper and lower % 4 == 0
+                        and upper % 4 == 0 and upper - lower <= max_bytes):
+                    ranges.add((lower, upper))
+            elif (insn.is_call and insn.call_target is None
+                    and operands and operands[0].type in ("reg", "mem")):
+                has_indirect_call = True
+
+        return sorted(ranges) if has_indirect_call else []
+
+    def _read_static_callback_table(self, lower, upper, original_starts):
+        """Validate and return a bounded table of static code pointers."""
+        targets = []
+        for entry_va in range(lower, upper, 4):
+            offset = va_to_file_offset(entry_va)
+            if offset is None or offset + 4 > len(self.xbe_data):
+                return None
+            target = struct.unpack_from('<I', self.xbe_data, offset)[0]
+            if target in (0, 0xFFFFFFFF):
                 continue
-            end = info.get("end", start)
-            recovered = self._recover_cfg(start, end, set(), set())
-            actual = 0 if recovered is None else len(recovered[0])
-            if recovered is None or actual != expected:
-                raise ValueError(
-                    f"External CFG 0x{start:08X}->0x{end:08X} has "
-                    f"{actual} instructions, expected {expected}")
-            if actual == 0:
-                # An entry that authenticates an empty body would install a
-                # CFG that owns bytes it never decoded, so refuse the record
-                # rather than let a zero count agree with itself.
-                raise ValueError(
-                    f"External CFG 0x{start:08X}->0x{end:08X} decoded no "
-                    "instructions")
-            instructions, jump_tables, _ = recovered
-            self._recovered_cfg[start] = {
-                "end": end,
-                "instructions": instructions,
-                "jump_tables": jump_tables,
-            }
+
+            index = bisect.bisect_right(original_starts, target)
+            if index and self.func_db[original_starts[index - 1]].get(
+                    "end", original_starts[index - 1]) > target:
+                targets.append(target)
+                continue
+            if index == 0 or index >= len(original_starts):
+                return None
+            previous = self.func_db[original_starts[index - 1]]
+            following = self.func_db[original_starts[index]]
+            if (previous.get("section") != following.get("section")
+                    or following.get("section") in (".rdata", ".data")
+                    or va_to_file_offset(target) is None):
+                return None
+            targets.append(target)
+
+        return targets if targets else None
+
+    def _is_strong_entry(self, func_info, addr=None):
+        """Return whether an entry has evidence independent of seed recovery."""
+        if addr is None:
+            addr = func_info.get("_addr")
+        return bool(
+            func_info.get("has_prologue")
+            or func_info.get("called_by")
+            or func_info.get("external_entry")
+            or func_info.get("detection_method") in self.STRONG_ENTRY_METHODS
+            or addr in self.coalesced_function_starts
+        )
 
     def discover_cfg_ownership(self):
         """Reassign weak seeds reached through a split computed-jump CFG."""
@@ -699,7 +808,7 @@ class FunctionTranslator:
         weak_by_section = {}
         for addr, info in self.func_db.items():
             section = info.get("section", "")
-            if self._is_strong_entry(info):
+            if self._is_strong_entry(info, addr):
                 by_section.setdefault(section, []).append(addr)
             else:
                 weak_by_section.setdefault(section, []).append(addr)
@@ -708,6 +817,11 @@ class FunctionTranslator:
             strong_starts.sort()
             weak_starts = sorted(weak_by_section.get(section, []))
             for index, start in enumerate(strong_starts[:-1]):
+                # Explicit coalescence already established this owner's exact
+                # extent. Keep it as a strong boundary for neighboring owners,
+                # but never use it as a seed for heuristic re-expansion.
+                if start in self.coalesced_function_starts:
+                    continue
                 original_end = self.func_db[start].get("end", start)
                 upper = strong_starts[index + 1]
                 if original_end >= upper:
@@ -903,7 +1017,8 @@ class FunctionTranslator:
             targets.append(target)
         return targets
 
-    def _recover_cfg(self, start, upper, bridge_targets, stop_addresses):
+    def _recover_cfg(self, start, upper, bridge_targets, stop_addresses,
+                     *, coalescing=False):
         """Decode direct CFG edges and local indexed-table destinations."""
         raw_bytes = self._read_func_bytes(start, upper)
         if not raw_bytes:
@@ -912,22 +1027,79 @@ class FunctionTranslator:
         entry_points = {start, *bridge_targets}
         jump_tables = {}
         while True:
+            stop_mnemonics = (("int3", "ud2", "hlt", "iret", "iretd")
+                              if coalescing else ("iret", "iretd"))
             instructions = self.disasm.disassemble_cfg(
                 raw_bytes, start, upper, entry_points,
-                stop_addresses=stop_addresses)
+                stop_addresses=stop_addresses,
+                stop_mnemonics=stop_mnemonics)
             changed = False
+            if coalescing:
+                computed_jump_edges = self._computed_jump_edges(
+                    instructions, start, upper,
+                    jump_table_targets=jump_tables)
+                refs = self._indirect_code_refs(
+                    instructions, start, upper, proof_mode=coalescing,
+                    computed_jump_edges=computed_jump_edges)
+                if refs - entry_points:
+                    entry_points.update(refs)
+                    changed = True
+                debug_slides = self._debug_slide_int3s(
+                    instructions, include_direct_targets=True)
+                slide_continuations = {
+                    insn.end_address for insn in instructions
+                    if (insn.address in debug_slides
+                        and insn.end_address < upper)
+                }
+                if slide_continuations - entry_points:
+                    entry_points.update(slide_continuations)
+                    changed = True
             for insn in instructions:
                 if not insn.is_jump or insn.jump_target is not None:
                     continue
                 if not insn.operands or insn.operands[0].type != "mem":
                     continue
                 operand = insn.operands[0]
-                if not operand.mem_index or operand.mem_base:
+                if operand.mem_seg == "fs":
+                    # Segment-relative memory does not use mem_disp as a linear
+                    # Xbox VA because fs: adds XBOX_FS_BASE at runtime. Never
+                    # use the raw displacement as destructive table evidence.
+                    continue
+                if not (operand.mem_index or operand.mem_base):
+                    continue
+                if operand.mem_index and operand.mem_base:
+                    continue
+                if operand.mem_base and not coalescing:
+                    continue
+                if operand.mem_index and operand.mem_scale != 4:
+                    # Destructive ownership proof only understands a dword
+                    # pointer table indexed by entry number. Other SIB scales
+                    # can skip/interleave dwords, so scanning every 4 bytes
+                    # would invent case targets that runtime cannot select.
                     continue
                 table_va = operand.mem_disp
-                if not (start <= table_va < upper):
+                if va_to_file_offset(table_va) is None:
                     continue
-                targets = self._read_local_jump_table(table_va, start, upper)
+                embedded = start <= table_va < upper
+                if not embedded:
+                    table_section = next((
+                        section for section in _config._SECTIONS
+                        if (section.va <= table_va
+                            and table_va + 4 <= section.va + section.raw_size)
+                    ), None)
+                    # Outside the owner's analysis extent, only accept a
+                    # mapped data-section table. Arbitrary bytes in another
+                    # code region are not strong enough deletion evidence.
+                    if table_section is None or table_section.is_code:
+                        continue
+                # Embedded tables must not absorb the jump's own displacement
+                # (or other decoded code) when scanning backward from the base.
+                minimum = (max((i.end_address for i in instructions
+                                if i.end_address <= table_va), default=start)
+                           if embedded else table_va)
+                targets = self._read_local_jump_table(
+                    table_va, start, upper,
+                    min_entry_va=minimum if coalescing else None)
                 if not targets:
                     continue
                 jump_tables[table_va] = targets
@@ -946,13 +1118,51 @@ class FunctionTranslator:
                     cfg_targets.update(targets)
                 return instructions, jump_tables, cfg_targets
 
+    def _stub_ret_bytes(self, addr, max_insns=48):
+        """Bytes the code at `addr` would have popped beyond the return address.
+
+        Returns the immediate of the first `ret N` reachable by walking
+        straight-line from addr, or 0 if the walk finds a plain `ret`, runs into
+        a call or an unconditional jump, or finds nothing at all.
+
+        Conditional branches are walked through rather than followed: the block
+        this is used on is a switch arm whose arms all share one epilogue, so
+        the not-taken path reaches the same ret. A call or a jmp means control
+        genuinely leaves, and guessing past that is how you get a wrong answer
+        that looks right.
+        """
+        offset = va_to_file_offset(addr)
+        if offset is None or not self.xbe_data:
+            return 0
+        window = self.xbe_data[offset:offset + max_insns * 8]
+        if not window:
+            return 0
+        try:
+            decoded = self.disasm._cs.disasm(window, addr)
+        except Exception:
+            return 0
+        for count, insn in enumerate(decoded):
+            if count >= max_insns:
+                break
+            mnemonic = insn.mnemonic.lower()
+            if mnemonic in ("call", "jmp"):
+                return 0
+            if mnemonic in ("ret", "retn"):
+                try:
+                    return int(insn.op_str, 0) if insn.op_str else 0
+                except ValueError:
+                    return 0
+        return 0
+
     def _read_local_jump_table(self, table_va, lower, upper,
-                               max_entries=256):
+                               max_entries=256, min_entry_va=None):
         """Read the contiguous pointer cluster around an indexed-jump base."""
         def scan(step, first):
             targets = []
             for index in range(first, max_entries + first):
                 entry_va = table_va + step * index * 4
+                if min_entry_va is not None and entry_va < min_entry_va:
+                    break
                 offset = va_to_file_offset(entry_va)
                 if offset is None or offset + 4 > len(self.xbe_data):
                     break
@@ -964,11 +1174,13 @@ class FunctionTranslator:
 
         backward = scan(-1, 1)
         forward = scan(1, 0)
-        if not forward:
-            # Some MSVC tables use the alignment remainder directly as the
-            # index. Slot zero is unreachable on this path and overlaps the
-            # preceding instruction, while slots one onward are real targets.
+        if not forward and len(backward) < 2:
+            # Slot 0 is not an arm when the index can never be 0: MSVC's CRT
+            # memcpy does `and eax, 3` on a path where eax is 1..3 and jumps
+            # through [eax*4 + LeadUpVec - 4], so the displacement points at
+            # the jmp's own bytes. See lifter._analyze_switch_table.
             forward = scan(1, 1)
+            backward = []
         if len(backward) + len(forward) < 2:
             return []
         backward.reverse()
@@ -992,6 +1204,46 @@ class FunctionTranslator:
             return "thiscall"
         return "cdecl"
 
+    _CARRY_CC = frozenset({
+        "b", "nae", "c", "ae", "nb", "nc", "be", "na", "a", "nbe",
+    })
+
+    @staticmethod
+    def _function_needs_cf(instructions):
+        """True when something in the function reads CF."""
+        from .lifter import (FLAG_SETTERS, CF_TRACKED, BT_MODIFY,
+                             _EFLAGS_SETTERS, _FLAGS_UNDEFINED,
+                             _is_rep_compare)
+
+        last_setter = None
+        for insn in instructions:
+            m = insn.mnemonic
+            if m in ("adc", "sbb", "stc", "clc", "cmc", "rcl", "rcr"):
+                return True
+            cc = None
+            if m.startswith("j") and len(m) > 1:
+                cc = m[1:]
+            elif m.startswith("set"):
+                cc = m[3:]
+            elif m.startswith("cmov") and len(m) > 4:
+                cc = m[4:]
+            if (cc in FunctionTranslator._CARRY_CC
+                    and (last_setter in CF_TRACKED
+                         or last_setter in ("inc", "dec")
+                         or last_setter in BT_MODIFY
+                         or last_setter == "rep-compare")):
+                return True
+            if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
+                last_setter = m
+            elif _is_rep_compare(insn):
+                # A REPE/REPNE CMPS/SCAS produces CF into _cf, so a jb/ja
+                # after one needs it declared. Anything else starting "rep"
+                # (movs/stos) leaves the flags and the setter alone.
+                last_setter = "rep-compare"
+            elif m in _FLAGS_UNDEFINED:
+                last_setter = None
+        return False
+
     def _func_has_prologue(self, instructions):
         """Check if function starts with push ebp; mov ebp, esp."""
         if len(instructions) < 2:
@@ -1000,6 +1252,653 @@ class FunctionTranslator:
                 instructions[0].op_str == "ebp" and
                 instructions[1].mnemonic == "mov" and
                 instructions[1].op_str == "ebp, esp")
+
+    def _func_owns_a_frame(self, instructions):
+        """True when the function has a frame, however it got one.
+
+        __SEH_prolog builds its caller's frame for it -- "lea ebp, [esp+0x10]"
+        inside the helper, after stashing the old ebp in the new frame -- so a
+        function that calls it owns a real frame without ever writing ebp
+        itself. Judging only on "push ebp; mov ebp, esp" calls those frameless,
+        and then the frame is never re-published across their calls: any
+        callee with a frame overwrites g_seh_ebp on entry and nothing puts it
+        back, so the next frameless callee inherits a dead frame.
+
+        Half-Life 2 hits this on its __finally funclets, which are ordinary
+        calls into a shared tail that reads the parent's locals through
+        g_seh_ebp. One of them leaves a critical section via
+        [[ebp-0x2c]+0x580]; with a stale frame that read a KeyValues string as
+        a pointer.
+        """
+        if self._func_has_prologue(instructions):
+            return True
+        seh_prologs = _seh_prologs_of(self.lifter)
+        if not seh_prologs:
+            return False
+        return any(getattr(insn, "call_target", None) in seh_prologs
+                   for insn in instructions)
+
+    def _indirect_code_refs(self, instructions, start, end, proof_mode=False,
+                            return_call_refs=False, return_jump_edges=False,
+                            computed_jump_edges=None):
+        """Immediate continuations used by register-jump dispatch.
+
+        Track constants along reachable CFG paths in both modes. Normal
+        translation conservatively unions targets proven on incoming edges so
+        unreachable bytes cannot erase a real local label. ``proof_mode`` is
+        stricter: a jump target must survive the merged incoming state before
+        it can justify deleting an interior function entry.
+        """
+        refs = set()
+        call_refs = set()
+        jump_edges = {}
+        computed_jump_edges = computed_jump_edges or {}
+
+        # Ordinary translation is non-destructive and historically kept every
+        # local immediate loaded into a GPR when the function contained a
+        # register-indirect jump. Keep that conservative candidate census in
+        # addition to the path-sensitive proof below. It preserves local labels
+        # across spill/reload sequences that this register-only dataflow cannot
+        # prove, while coalescence proof mode remains strict.
+        if not proof_mode:
+            has_register_jump = any(
+                insn.mnemonic == "jmp" and not insn.jump_target
+                and insn.operands and insn.operands[0].type == "reg"
+                for insn in instructions)
+            if has_register_jump:
+                full_gprs = {"eax", "ebx", "ecx", "edx",
+                             "esi", "edi", "ebp", "esp"}
+                for insn in instructions:
+                    operands = insn.operands
+                    candidate = None
+                    if (insn.mnemonic == "mov" and len(operands) >= 2
+                            and operands[0].type == "reg"
+                            and operands[0].reg in full_gprs
+                            and operands[1].type == "imm"):
+                        candidate = operands[1].imm
+                    elif (insn.mnemonic == "lea" and len(operands) >= 2
+                          and operands[0].type == "reg"
+                          and operands[0].reg in full_gprs
+                          and operands[1].type == "mem"
+                          and not operands[1].mem_base
+                          and not operands[1].mem_index):
+                        candidate = operands[1].mem_disp & 0xFFFFFFFF
+                    if candidate is not None and start <= candidate < end:
+                        refs.add(candidate)
+
+        def pack_result():
+            if return_call_refs and return_jump_edges:
+                return refs, call_refs, jump_edges
+            if return_call_refs:
+                return refs, call_refs
+            if return_jump_edges:
+                return refs, jump_edges
+            return refs
+        aliases = {
+            "eax": "eax", "ax": "eax", "al": "eax", "ah": "eax",
+            "ebx": "ebx", "bx": "ebx", "bl": "ebx", "bh": "ebx",
+            "ecx": "ecx", "cx": "ecx", "cl": "ecx", "ch": "ecx",
+            "edx": "edx", "dx": "edx", "dl": "edx", "dh": "edx",
+            "esi": "esi", "si": "esi", "edi": "edi", "di": "edi",
+            "ebp": "ebp", "bp": "ebp", "esp": "esp", "sp": "esp",
+        }
+        full_registers = {"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"}
+        non_writers = {
+            "cmp", "test", "push", "jmp", "bt",
+            "prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2",
+        }
+        implicit_clobbers = {
+            "cbw": {"eax"}, "cwde": {"eax"}, "cdq": {"edx"},
+            "cwd": {"edx"}, "cpuid": {"eax", "ebx", "ecx", "edx"},
+            "rdtsc": {"eax", "edx"}, "lahf": {"eax"},
+            "lodsb": {"eax", "esi"}, "lodsw": {"eax", "esi"},
+            "lodsd": {"eax", "esi"},
+            "movsb": {"esi", "edi"}, "movsw": {"esi", "edi"},
+            "stosb": {"edi"}, "stosw": {"edi"}, "stosd": {"edi"},
+            "scasb": {"edi"}, "scasw": {"edi"}, "scasd": {"edi"},
+            "cmpsb": {"esi", "edi"}, "cmpsw": {"esi", "edi"},
+            "loop": {"ecx"}, "loope": {"ecx"}, "loopne": {"ecx"},
+            "leave": {"esp", "ebp"}, "popad": set(full_registers),
+            "xlat": {"eax"}, "xlatb": {"eax"},
+        }
+
+        def memory_key(operand):
+            if operand.type != "mem":
+                return None
+            return ("mem", operand.mem_seg, operand.mem_base,
+                    operand.mem_index, operand.mem_scale,
+                    operand.mem_disp, operand.mem_size)
+
+        def memory_keys(constants):
+            return [key for key in constants
+                    if isinstance(key, tuple) and key[:1] == ("mem",)]
+
+        def clear_memory(constants):
+            for key in memory_keys(constants):
+                constants.pop(key, None)
+
+        def clear_memory_using_register(constants, register):
+            for key in memory_keys(constants):
+                if register in key[2:4]:
+                    constants.pop(key, None)
+
+        def pushed_value_from(operands, constants):
+            if not operands:
+                return None
+            source = operands[0]
+            if source.type == "imm":
+                return source.imm
+            if source.type == "reg" and source.reg in full_registers:
+                return constants.get(source.reg)
+            if source.type == "mem" and source.mem_size == 4:
+                return constants.get(memory_key(source))
+            return None
+
+        def transfer(insn, incoming):
+            constants = dict(incoming)
+            operands = insn.operands
+            preserved_writes = set()
+            pushed_value = (pushed_value_from(operands, constants)
+                            if insn.mnemonic == "push" else None)
+            popped_value = None
+            pop_destination = None
+            if (insn.mnemonic == "pop" and operands
+                    and operands[0].type == "reg"
+                    and operands[0].reg in full_registers):
+                pop_destination = aliases.get(
+                    operands[0].reg, operands[0].reg)
+                popped_value = constants.get(
+                    ("mem", None, "esp", None, 1, 0, 4))
+            if (insn.mnemonic == "mov" and len(operands) >= 2
+                    and operands[0].type == "reg"):
+                raw_destination = operands[0].reg
+                destination = aliases.get(raw_destination, raw_destination)
+                source = operands[1]
+                if raw_destination not in full_registers:
+                    constants.pop(destination, None)
+                elif source.type == "imm":
+                    constants[destination] = source.imm
+                    preserved_writes.add(destination)
+                elif (source.type == "reg" and source.reg in full_registers
+                      and source.reg in constants):
+                    constants[destination] = constants[source.reg]
+                    preserved_writes.add(destination)
+                elif (source.type == "mem" and source.mem_size == 4
+                      and memory_key(source) in constants):
+                    constants[destination] = constants[memory_key(source)]
+                    preserved_writes.add(destination)
+                else:
+                    constants.pop(destination, None)
+            elif (insn.mnemonic == "mov" and len(operands) >= 2
+                  and operands[0].type == "mem"):
+                # Exact spill slots are useful independent-entry evidence for
+                # memory-indirect calls. Treat every other memory write as a
+                # possible alias, then remember only the value written by this
+                # instruction when it is itself provable.
+                destination = memory_key(operands[0])
+                source = operands[1]
+                clear_memory(constants)
+                if destination is not None:
+                    if source.type == "imm":
+                        constants[destination] = source.imm
+                    elif source.type == "reg" and source.reg in constants:
+                        constants[destination] = constants[source.reg]
+            elif (insn.mnemonic == "lea" and len(operands) >= 2
+                  and operands[0].type == "reg"
+                  and operands[1].type == "mem"):
+                raw_destination = operands[0].reg
+                destination = aliases.get(raw_destination, raw_destination)
+                source = operands[1]
+                if (raw_destination in full_registers
+                        and not source.mem_base and not source.mem_index):
+                    constants[destination] = source.mem_disp & 0xFFFFFFFF
+                    preserved_writes.add(destination)
+                else:
+                    constants.pop(destination, None)
+
+            for written in getattr(insn, "regs_written", ()):
+                register = aliases.get(written, written)
+                if register in full_registers:
+                    # A tracked symbolic slot [reg+...] names a different
+                    # address after *any* assignment to that register, even
+                    # when the new register value itself remains provable.
+                    clear_memory_using_register(constants, register)
+                if register in full_registers and register not in preserved_writes:
+                    constants.pop(register, None)
+
+            if insn.mnemonic == "push":
+                # PUSH writes the guest stack through the newly decremented ESP.
+                # Without concrete alias analysis, conservatively forget every
+                # prior spill fact, then model only the new dword at [esp].
+                clear_memory(constants)
+                if pushed_value is not None:
+                    constants[("mem", None, "esp", None, 1, 0, 4)] = pushed_value
+
+            if pop_destination is not None and popped_value is not None:
+                constants[pop_destination] = popped_value
+
+            if (operands and operands[0].type == "mem"
+                    and insn.mnemonic not in non_writers
+                    and insn.mnemonic not in ("mov", "lea", "call")):
+                clear_memory(constants)
+
+            mnemonic = insn.mnemonic.removeprefix("lock ")
+            if mnemonic in ("cmpxchg", "cmpxchg8b"):
+                constants.pop("eax", None)
+                if mnemonic == "cmpxchg8b":
+                    constants.pop("edx", None)
+
+            if insn.is_call:
+                # Generated callees execute their actual guest register writes;
+                # the translator does not enforce a host ABI that restores
+                # ebx/esi/edi/ebp. Unless preservation is proven, no tracked
+                # register or spill value is valid across a call.
+                constants.clear()
+            elif insn.mnemonic == "xchg":
+                for operand in operands[:2]:
+                    if operand.type == "reg":
+                        constants.pop(aliases.get(operand.reg, operand.reg), None)
+            elif (insn.mnemonic in ("mul", "div", "idiv")
+                  or (insn.mnemonic == "imul" and len(operands) == 1)):
+                constants.pop("eax", None)
+                constants.pop("edx", None)
+
+            clobbers = implicit_clobbers.get(insn.mnemonic, ())
+            if insn.mnemonic in ("movsd", "cmpsd"):
+                mem_bases = {operand.mem_base for operand in operands
+                             if operand.type == "mem"}
+                if {"esi", "edi"}.issubset(mem_bases):
+                    clobbers = {"esi", "edi"}
+            for register in clobbers:
+                constants.pop(register, None)
+            return constants
+
+        def jump_target_from(insn, constants):
+            operands = insn.operands
+            if (insn.mnemonic == "jmp" and not insn.jump_target and operands
+                    and operands[0].type == "reg"):
+                target = constants.get(aliases.get(
+                    operands[0].reg, operands[0].reg))
+                if target is not None and start <= target < end:
+                    return target
+            return None
+
+        def call_target_from(insn, constants):
+            operands = insn.operands
+            if (insn.is_call and not getattr(insn, "call_target", None)
+                    and operands):
+                if operands[0].type == "reg":
+                    target = constants.get(aliases.get(
+                        operands[0].reg, operands[0].reg))
+                elif operands[0].type == "mem":
+                    target = constants.get(memory_key(operands[0]))
+                else:
+                    target = None
+                if target is not None and start <= target < end:
+                    return target
+            return None
+
+        def retained_memory_jump_target_from(insn, constants):
+            operands = insn.operands
+            if (insn.mnemonic == "jmp" and not insn.jump_target and operands
+                    and operands[0].type == "mem"):
+                target = constants.get(memory_key(operands[0]))
+                if target is not None and start <= target < end:
+                    return target
+            return None
+
+        # Track constants along actual CFG edges. Destructive coalescence keeps
+        # a jump target only when every incoming path agrees; ordinary
+        # translation may keep the union of per-edge targets for dispatch labels.
+        ordered = sorted(instructions, key=lambda insn: insn.address)
+        if not ordered or ordered[0].address != start:
+            return pack_result()
+        by_address = {insn.address: insn for insn in ordered}
+        fallthrough = {}
+        for current, following in zip(ordered, ordered[1:]):
+            if current.end_address == following.address:
+                fallthrough[current.address] = following.address
+        debug_slides = FunctionTranslator._debug_slide_int3s(ordered)
+
+        def static_successors(insn):
+            if (insn.is_ret or insn.mnemonic in ("ud2", "hlt", "iret", "iretd")
+                    or (insn.mnemonic == "int3"
+                        and insn.address not in debug_slides)):
+                return ()
+            if insn.is_jump:
+                out = []
+                if insn.jump_target in by_address:
+                    out.append(insn.jump_target)
+                out.extend(
+                    target for target in computed_jump_edges.get(insn.address, ())
+                    if target in by_address)
+                return tuple(dict.fromkeys(out))
+
+            out = []
+            if insn.is_cond_jump and insn.jump_target in by_address:
+                out.append(insn.jump_target)
+            next_address = fallthrough.get(insn.address)
+            if next_address is not None:
+                out.append(next_address)
+            return tuple(dict.fromkeys(out))
+
+        def merge_contributions(contributions):
+            states = list(contributions.values())
+            if not states:
+                return None
+            first = states[0]
+            return {
+                register: value
+                for register, value in first.items()
+                if all(state.get(register) == value for state in states[1:])
+            }
+
+        incoming_states = {start: {None: {}}}
+        entry_states = {start: {}}
+        dynamic_edges = {}
+        observed_entry_refs = set()
+        worklist = [start]
+        while worklist:
+            address = worklist.pop()
+            if address not in entry_states:
+                continue
+            insn = by_address[address]
+            incoming = entry_states[address]
+            if return_call_refs:
+                # Entry-retention evidence is monotonic. A later loop join can
+                # weaken a contribution, but it must not erase a call/jump path
+                # that was proven on an earlier iteration.
+                for contribution in incoming_states.get(address, {}).values():
+                    target = call_target_from(insn, contribution)
+                    if target is None:
+                        target = retained_memory_jump_target_from(
+                            insn, contribution)
+                    if target is not None:
+                        observed_entry_refs.add(target)
+            outgoing = transfer(insn, incoming)
+            static = set(static_successors(insn))
+            dynamic_target = jump_target_from(insn, incoming)
+            observed = dynamic_edges.setdefault(address, set())
+            if dynamic_target in by_address:
+                observed.add(dynamic_target)
+
+            # Dynamic edges are monotonic. Once a register jump has been proven
+            # to reach a local block, a later loop/join may weaken the register
+            # state so that exact target is no longer known. Removing the edge
+            # in that situation can make the worklist alternate forever between
+            # "edge present" and "edge absent". Keep the edge as a possible
+            # predecessor instead, but feed it unknown state unless it is still
+            # proven on this iteration. That can only discard constants and the
+            # finite dataflow therefore converges conservatively.
+            successors = static | observed
+            for successor in successors:
+                contributions = incoming_states.setdefault(successor, {})
+                if successor in static or successor == dynamic_target:
+                    contribution = dict(outgoing)
+                else:
+                    contribution = {}
+                if contributions.get(address) == contribution:
+                    continue
+                contributions[address] = contribution
+                merged = merge_contributions(contributions)
+                previous = entry_states.get(successor)
+                if previous != merged:
+                    entry_states[successor] = merged
+                    worklist.append(successor)
+
+        for address, incoming in entry_states.items():
+            insn = by_address[address]
+            if proof_mode:
+                target = jump_target_from(insn, incoming)
+                if target is not None:
+                    refs.add(target)
+                    jump_edges.setdefault(address, set()).add(target)
+            else:
+                # Translation only needs a conservative target census. Keep
+                # every target proven on an incoming CFG edge so unreachable
+                # bytes in address order cannot erase a real continuation.
+                for contribution in incoming_states.get(address, {}).values():
+                    target = jump_target_from(insn, contribution)
+                    if target is not None:
+                        refs.add(target)
+                        jump_edges.setdefault(address, set()).add(target)
+
+            if return_call_refs:
+                # A single proven path to an indirect call, or an exact
+                # memory-held indirect jump that the current lifter would emit
+                # as RECOMP_ITAIL, requires retaining a standalone entry.
+                for contribution in incoming_states.get(address, {}).values():
+                    target = call_target_from(insn, contribution)
+                    if target is None:
+                        target = retained_memory_jump_target_from(
+                            insn, contribution)
+                    if target is not None:
+                        call_refs.add(target)
+
+        if return_call_refs:
+            call_refs.update(observed_entry_refs)
+
+        return pack_result()
+
+    @staticmethod
+    def _debug_slide_int3s(instructions, include_direct_targets=False,
+                           extra_entry_targets=()):
+        """Return INT3 bytes that are unambiguous Xbox INT 2D slide bytes."""
+        slides = set()
+        direct_targets = set(extra_entry_targets)
+        direct_targets.update({
+            insn.jump_target for insn in instructions
+            if insn.jump_target is not None
+        })
+        previous = None
+        for instruction in instructions:
+            if (instruction.mnemonic == "int3" and previous is not None
+                    and previous.end_address == instruction.address
+                    and previous.mnemonic == "int" and previous.operands
+                    and previous.operands[0].type == "imm"
+                    and previous.operands[0].imm == 0x2D
+                    and (include_direct_targets
+                         or instruction.address not in direct_targets)):
+                slides.add(instruction.address)
+            previous = instruction
+        return slides
+
+    @staticmethod
+    def _debug_slide_bypasses(instructions, extra_entry_targets=()):
+        """Map INT 2D instructions to post-INT3 targets when INT3 has another entry."""
+        direct_targets = set(extra_entry_targets)
+        direct_targets.update({
+            insn.jump_target for insn in instructions
+            if insn.jump_target is not None
+        })
+        bypasses = {}
+        previous = None
+        for instruction in instructions:
+            if (instruction.mnemonic == "int3" and previous is not None
+                    and instruction.address in direct_targets
+                    and previous.end_address == instruction.address
+                    and previous.mnemonic == "int" and previous.operands
+                    and previous.operands[0].type == "imm"
+                    and previous.operands[0].imm == 0x2D):
+                bypasses[previous.address] = instruction.end_address
+            previous = instruction
+        return bypasses
+
+    def _computed_jump_edges(self, instructions, start, end,
+                             jump_table_targets=None):
+        """Return validated local targets for memory-indirect jumps.
+
+        ``jump_table_targets`` is an optional table census already validated by
+        CFG recovery. When supplied, only those tables are trusted. Otherwise
+        the normal lifter switch-table analysis is used.
+        """
+        edges = {}
+        for insn in instructions:
+            if (insn.mnemonic != "jmp" or insn.jump_target is not None
+                    or not insn.operands or insn.operands[0].type != "mem"):
+                continue
+            operand = insn.operands[0]
+            if jump_table_targets is None:
+                targets = self.lifter._analyze_switch_table(insn.operands)
+            else:
+                targets = jump_table_targets.get(operand.mem_disp, ())
+            local = {target for target in targets if start <= target < end}
+            if local:
+                edges[insn.address] = local
+        return edges
+
+    @staticmethod
+    def _authoritative_jump_tables(instructions, jump_table_targets):
+        """Keep a recovered jump-table decision authoritative during lifting.
+
+        The lifter normally falls back to reading a table when its address is
+        absent from ``jump_table_targets``. For recovered CFGs, absence means
+        the recovery deliberately did not validate that memory-indirect jump as
+        a local switch. Record an explicit empty entry so later emission cannot
+        silently rediscover targets that the CFG census rejected.
+        """
+        if jump_table_targets is None:
+            return None
+        census = {table: list(targets)
+                  for table, targets in jump_table_targets.items()}
+        for insn in instructions:
+            if (insn.mnemonic != "jmp" or insn.jump_target is not None
+                    or not insn.operands or insn.operands[0].type != "mem"):
+                continue
+            table_va = insn.operands[0].mem_disp
+            if table_va:
+                census.setdefault(table_va, [])
+        return census
+
+    def _control_flow_census(self, instructions, start, end, coalesced=False,
+                             jump_table_targets=None):
+        """Build the shared census of computed CFG edges and entry leaders."""
+        table_edges = self._computed_jump_edges(
+            instructions, start, end, jump_table_targets=jump_table_targets)
+        imm_refs, register_edges = self._indirect_code_refs(
+            instructions, start, end, return_jump_edges=True,
+            computed_jump_edges=table_edges)
+
+        computed_jump_edges = {
+            address: set(targets) for address, targets in table_edges.items()
+        }
+        for address, targets in register_edges.items():
+            computed_jump_edges.setdefault(address, set()).update(targets)
+
+        computed_entries = set(imm_refs)
+        for targets in computed_jump_edges.values():
+            computed_entries.update(targets)
+
+        extra_entries = computed_entries if coalesced else ()
+        debug_slide_int3s = self._debug_slide_int3s(
+            instructions, extra_entry_targets=extra_entries)
+        debug_slide_bypasses = (
+            self._debug_slide_bypasses(
+                instructions, extra_entry_targets=extra_entries)
+            if coalesced else {})
+
+        switch_leaders = set(computed_entries)
+        switch_leaders.update(debug_slide_bypasses.values())
+        if coalesced:
+            instruction_starts = {insn.address for insn in instructions}
+            switch_leaders.update(
+                insn.end_address for insn in instructions
+                if (insn.mnemonic == "int3"
+                    and insn.end_address in instruction_starts))
+
+        return (imm_refs, computed_jump_edges, debug_slide_int3s,
+                debug_slide_bypasses, switch_leaders)
+
+    def decode_function(self, start, end):
+        """Recover instructions and blocks, including indirect-entry leaders."""
+        recovered = self._recovered_cfg.get(start)
+        if recovered:
+            end = recovered["end"]
+        if end <= start:
+            return [], []
+
+        # Read bytes from XBE
+        raw_bytes = self._read_func_bytes(start, end)
+        if not raw_bytes:
+            return [], []
+
+        # Set function bounds for the lifter
+        self.lifter.func_start = start
+        self.lifter.func_end = end
+        validated_jump_tables = recovered["jump_tables"] if recovered else None
+        self.lifter.icall_site_targets = self.icall_sites
+
+        # Disassemble
+        instructions = (recovered["instructions"] if recovered else
+                        self.disasm.disassemble_function(raw_bytes, start, end))
+        if not instructions:
+            return [], []
+        authoritative_jump_tables = self._authoritative_jump_tables(
+            instructions, validated_jump_tables)
+        self.lifter.jump_table_targets = (
+            authoritative_jump_tables
+            if authoritative_jump_tables is not None else {})
+        coalesced = start in self.coalesced_function_starts
+        (imm_refs, computed_jump_edges, debug_slide_int3s,
+         debug_slide_bypasses, switch_leaders) = self._control_flow_census(
+             instructions, start, end, coalesced,
+             jump_table_targets=authoritative_jump_tables)
+
+        # A switch target the decode never produced an instruction for cannot
+        # become a block leader, so it gets no label and its `goto` is dropped
+        # as dead code. Re-decode at every newly discovered leader and refresh
+        # the computed-edge census until both describe the same instruction set.
+        if recovered is None:
+            resync = set()
+            while True:
+                missing = switch_leaders - {
+                    insn.address for insn in instructions}
+                new_missing = missing - resync
+                if not new_missing:
+                    break
+                resync.update(new_missing)
+                instructions = self.disasm.disassemble_function(
+                    raw_bytes, start, end, resync=resync)
+                if not instructions:
+                    return [], []
+                (imm_refs, computed_jump_edges, debug_slide_int3s,
+                 debug_slide_bypasses,
+                 switch_leaders) = self._control_flow_census(
+                     instructions, start, end, coalesced)
+
+        self.lifter.imm_code_refs = imm_refs
+
+        # Build basic blocks
+        blocks = self.disasm.build_basic_blocks(
+            instructions, start, end,
+            extra_leaders=switch_leaders if switch_leaders else None,
+            stop_mnemonics=("ud2", "hlt", "iret", "iretd")
+            if coalesced else ("iret", "iretd"))
+        block_starts = {block.start for block in blocks}
+        for block in blocks:
+            last = block.last_insn
+            if last is None:
+                continue
+            for target in computed_jump_edges.get(last.address, ()):
+                if target in block_starts and target not in block.successors:
+                    block.successors.append(target)
+        if coalesced:
+            for block in blocks:
+                bypass = (debug_slide_bypasses.get(block.last_insn.address)
+                          if block.last_insn is not None else None)
+                if bypass is not None:
+                    slide = block.last_insn.end_address
+                    block.successors = [
+                        bypass if successor == slide else successor
+                        for successor in block.successors
+                    ]
+                    if bypass not in block.successors:
+                        block.successors.append(bypass)
+                if (block.last_insn is not None
+                        and block.last_insn.mnemonic == "int3"
+                        and block.last_insn.address not in debug_slide_int3s):
+                    block.successors = []
+        return instructions, blocks
 
     def translate_function(self, func_addr, func_info):
         """
@@ -1014,68 +1913,9 @@ class FunctionTranslator:
         if end <= start:
             return None
 
-        name = func_info.get("name", f"sub_{start:08X}")
+        name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
         size = end - start
-
-        # Read bytes from XBE
-        raw_bytes = self._read_func_bytes(start, end)
-        if not raw_bytes:
-            return None
-
-        # Set function bounds for the lifter
-        self.lifter.func_start = start
-        self.lifter.func_end = end
-        self.lifter.jump_table_targets = (
-            recovered["jump_tables"] if recovered else {})
-
-        # Disassemble
-        instructions = (recovered["instructions"] if recovered else
-                        self.disasm.disassemble_function(raw_bytes, start, end))
-        if not instructions:
-            return None
-
-        if not recovered:
-            addresses = {insn.address for insn in instructions}
-            linear_jump_tables = {}
-            for insn in instructions:
-                if (insn.mnemonic != "jmp" or insn.jump_target
-                        or not insn.operands
-                        or insn.operands[0].type != "mem"):
-                    continue
-                operand = insn.operands[0]
-                if not operand.mem_index or operand.mem_base:
-                    continue
-                targets = self._read_local_jump_table(
-                    operand.mem_disp, start, end)
-                if targets:
-                    linear_jump_tables[operand.mem_disp] = targets
-            missing_switch_target = any(
-                target not in addresses
-                for targets in linear_jump_tables.values()
-                for target in targets)
-            if missing_switch_target:
-                recovered = self._recover_cfg(start, end, set(), set())
-                if recovered:
-                    instructions, jump_tables, _ = recovered
-                    self.lifter.jump_table_targets = jump_tables
-            else:
-                self.lifter.jump_table_targets = linear_jump_tables
-        self.translated_function_starts.add(start)
-        self.lifter.configure_mmx(instructions)
-
-        # Collect switch table targets as extra block leaders
-        switch_leaders = set()
-        for insn in instructions:
-            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
-                targets = self.lifter._analyze_switch_table(insn.operands)
-                for t in targets:
-                    if start <= t < end:
-                        switch_leaders.add(t)
-
-        # Build basic blocks
-        blocks = self.disasm.build_basic_blocks(
-            instructions, start, end,
-            extra_leaders=switch_leaders if switch_leaders else None)
+        instructions, blocks = self.decode_function(start, end)
         if not blocks:
             return None
 
@@ -1116,11 +1956,21 @@ class FunctionTranslator:
         # usable target; anything else is an analysis boundary gap with no
         # callable symbol.
         last_insn = instructions[-1]
-        continues_past_end = not (
+        coalesced = start in self.coalesced_function_starts
+        (_, _, debug_slide_int3s,
+         debug_slide_bypasses, switch_leaders) = self._control_flow_census(
+             instructions, start, end, coalesced,
+             jump_table_targets=(self.lifter.jump_table_targets
+                                 if coalesced and start in self._recovered_cfg
+                                 else None))
+        last_is_debug_slide = (coalesced
+                               and last_insn.address in debug_slide_int3s)
+        continues_past_end = last_is_debug_slide or not (
             last_insn.is_terminator
-            or last_insn.mnemonic in ("int3", "ud2", "hlt"))
+            or last_insn.mnemonic in ("int3", "ud2", "hlt", "iret", "iretd"))
         fallthrough_target = None
-        if (continues_past_end and end in self.func_db
+        bypasses_to_end = end in debug_slide_bypasses.values()
+        if ((continues_past_end or bypasses_to_end) and end in self.func_db
                 and end not in self.owned_function_starts):
             fallthrough_target = end
 
@@ -1139,16 +1989,22 @@ class FunctionTranslator:
         if has_tail_jump or fallthrough_target is not None:
             used_regs.add("ebp")
 
-        # Ensure ebp tracked if function calls __SEH_prolog or __SEH_epilog
-        # (lifter emits ebp = g_seh_ebp readback after these calls).
-        SEH_FUNCS = {0x001BB5DC, 0x001BB617}
-        if any(insn.call_target in SEH_FUNCS for insn in instructions):
-            used_regs.add("ebp")
 
-        # A translated callee that inherits or saves EBP reads g_seh_ebp at
-        # its C entry boundary. Publish this function's live local EBP before
-        # each call so that boundary observes the hardware caller context.
-        self.lifter.current_function_has_ebp = "ebp" in used_regs
+        # Ensure ebp is declared if the function talks to the SEH helpers: the
+        # lifter emits a publish before and a read-back after those calls, both
+        # of which name ebp even in a function that otherwise never touches it.
+        #
+        # These addresses are per-title and detected at startup. They used to be
+        # hardcoded to one game's CRT here, so for every other title the forcing
+        # silently never fired and the generated C failed to compile with
+        # "'ebp': undeclared identifier".
+        seh_funcs = _seh_prologs_of(self.lifter)
+        epilog = getattr(self.lifter, "SEH_EPILOG", None)
+        if epilog is not None:
+            seh_funcs = seh_funcs | {epilog}
+        if seh_funcs and any(insn.call_target in seh_funcs
+                             for insn in instructions):
+            used_regs.add("ebp")
 
         # Build call targets list
         call_targets = set()
@@ -1184,6 +2040,37 @@ class FunctionTranslator:
         lines.append(f"{ret_type} {name}({param_str})")
         lines.append(f"{{")
 
+        # Optional entry trace. Bring-up is mostly "which of these ten init
+        # calls does it not come back from", and answering that by overriding
+        # a function loses the body you were trying to observe.
+        if start in self.trace_functions:
+            lines.append(
+                f'    RECOMP_TRACE_ENTER("{name}", 0x{start:08X});')
+        # Entry tracing shows what went in; it cannot show what came back, and
+        # "this function returns with esi wrong" is exactly the question that
+        # kept coming up. The lifter emits the matching exit trace at each ret.
+        self.lifter.trace_exit_name = name if start in self.trace_functions else None
+
+        # --force-return: hand this function's callers a constant.
+        #
+        # Bring-up keeps arriving at the same shape. A title waits on a
+        # service the runtime does not implement yet; the function that
+        # reports "is it finished" answers no for ever; everything past it is
+        # unreachable and therefore untestable. Shin Megami Tensei: Nine does
+        # exactly this -- its title screen asks whether the intro movie has
+        # ended, and its XMV decoder never reaches end of stream.
+        #
+        # What people resort to instead is editing the generated C by hand,
+        # which buries the shortcut in hundreds of megabytes of output where
+        # nothing names it and nobody else can reproduce the run. As a
+        # generation option it is on the command line, it lands in the
+        # title's build script, and the emitted code is inert unless
+        # RECOMP_FORCE_RETURN is set at run time.
+        #
+        # It is a probe, not a fix: the body still runs and its side effects
+        # still happen, only the answer changes.
+        self.lifter.force_return_value = self.force_returns.get(start)
+
         # ebp is the only callee-saved register declared as a local.
         # ebx, esi, edi are global via #define macros (g_ebx, g_esi, g_edi)
         # and must NOT be declared locally, otherwise the local shadows
@@ -1193,46 +2080,124 @@ class FunctionTranslator:
         if "ebp" in used_regs:
             reg_decls.append("ebp")
         if reg_decls:
-            lines.append(f"    uint32_t {', '.join(reg_decls)};")
+            # Initialised, not just declared. A function with a real
+            # "push ebp; mov ebp, esp" prologue pushes ebp before it ever
+            # assigns one, so its first statement reads this local while the
+            # value is still indeterminate. At -O0 that is whatever the host
+            # stack happened to hold; from -O1 up it is poison the compiler is
+            # free to propagate, and the pushed word is a frame pointer the
+            # epilogue pops back and callers may walk.
+            decls = ", ".join(f"{r} = 0" for r in reg_decls)
+            lines.append(f"    uint32_t {decls};")
+
+        # A function with no `push ebp; mov ebp, esp` prologue that still reads
+        # ebp is addressing its *caller's* frame. MSVC emits these for shared
+        # tails and helpers; Halo's CRT float formatting (sub_001DEC07) opens
+        # with `cmp byte ptr [edx+0xe], 5` and goes straight to [ebp-0xa4].
+        #
+        # ebp is a per-function local, so without this it starts as garbage and
+        # every [ebp-N] store lands wherever that points. In Halo that was the
+        # fake TIB at Xbox VA 0: `mov [ebp-0xa2], bx` destroyed fs:[4], and the
+        # next TLS lookup faulted, thousands of calls away from the cause.
+        #
+        # Inherit it instead. Frame-establishing functions publish g_ebp when
+        # they execute `mov ebp, esp` (see the lifter), so the value is the
+        # nearest enclosing frame -- which is exactly what the hardware ebp
+        # would still hold. Deliberately not the same as making ebp global:
+        # that also changes save/restore, and a callee that fails to restore
+        # then corrupts its caller (tried; esp underflowed inside XapiStartup).
+        if "ebp" in used_regs and self._func_has_prologue(instructions):
+            # The prologue's first PUSH saves the incoming register before
+            # MOV establishes this function's frame. It must not push an
+            # uninitialized C local into the guest's saved-frame chain.
+            lines.append("    ebp = g_ebp;  /* prologue saves caller's frame */")
+        elif "ebp" in used_regs:
+            lines.append("    ebp = g_ebp;  /* frameless: caller's frame */")
 
         # Add _flags variable if function has conditional instructions
+        # String compares write _flags themselves (the rep forms, and since
+        # they are lifted, the bare ones), with or without a jcc after them.
         has_conditionals = any(
             insn.is_cond_jump or insn.mnemonic.startswith("set")
             or insn.mnemonic.startswith("cmov")
+            or "cmps" in insn.mnemonic or "scas" in insn.mnemonic
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
 
-        # Add _cf for carry-dependent instructions (sbb, adc)
-        has_carry = any(insn.mnemonic in ("sbb", "adc")
-                        for insn in instructions)
+        # Flag snapshot temporaries: a cmp/test records its operands here,
+        # zero- and sign-extended to the compare's own width, so the branch
+        # tests what the compare actually saw. Declared whenever a cmp/test
+        # exists - the consuming jcc can be in a later basic block, or absent.
+        # bsf/bsr publish ZF through the same pair (the source, against 0), so
+        # a function whose only flag-setter is a bit scan still needs them --
+        # sub_000EEA10 in Wreckless is exactly `bsf eax, ecx; ret`.
+        # cmpxchg belongs here too: it snapshots the compare it performed,
+        # because eax may be replaced before the branch reads the result.
+        if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
+                                 "lock cmpxchg", "inc", "dec")
+               or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
+               for insn in instructions):
+            lines.append("    uint32_t _fa = 0, _fb = 0;")
+            lines.append("    int32_t _fas = 0, _fbs = 0;")
+            lines.append("    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;")
+            # Flag snapshot: a cmp/test that is not fused with its jcc records
+            # its operands here, zero- and sign-extended to the compare's own
+            # width, so the branch tests what the compare saw.
+
+
+        # Float compare snapshot, same reasoning as the integer one above and
+        # for a sharper reason: an SSE compare is routinely followed by a `lea`
+        # that overwrites the very register the address was built from. MSVC
+        # emits exactly that in Half-Life 2's displacement collision builder --
+        #
+        #   comiss xmm5, [esi + eax*4]     ; compare with the old eax
+        #   lea    eax, [esi + eax*4]      ; then eax becomes the pointer
+        #
+        # -- so reconstructing the comparison at the jcc read `esi + eax*4`
+        # with eax already holding a pointer. The address wrapped to guest
+        # 0x651BCD20 and the level load died in CDispCollTree.
+        if any(insn.mnemonic in ("comiss", "comisd", "ucomiss", "ucomisd")
+               for insn in instructions):
+            lines.append("    double _fca = 0.0, _fcb = 0.0;")
+            lines.append("    (void)_fca; (void)_fcb;")
+
+        # Add _cf for carry-dependent instructions.
+        #
+        # adc/sbb read CF directly, and so does a jb/jae whose flags came from
+        # arithmetic rather than a cmp -- the bit-stream decoders in the Xbox
+        # XCompress code are nothing but "add reg,reg" followed by jae, and a
+        # cmovb/cmovae after an add reads the same carry. Which setter a branch
+        # reads is the lifter's tracking rule, mirrored here so only the
+        # functions that consume CF declare it: computing it beside every add
+        # in the image would be a line per add in 48,000 functions.
+        has_carry = self._function_needs_cf(instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
+        # Only functions that consume CF pay for producing it: an adc/sbb
+        # reading a never-written _cf silently drops every carry, which
+        # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
+        # idiom MSVC emits for odd trailing elements.
+        self.lifter.needs_cf = has_carry
+        self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
 
-        # SSE/MMX register declarations
-        if used_xmm:
-            xmm_regs = sorted([r for r in used_xmm if r.startswith("xmm")])
-            mmx_regs = sorted([r for r in used_xmm if r.startswith("mm")
-                               and not r.startswith("xmm")])
-            # XMM is architectural state and is declared globally by the
-            # runtime, exactly like the GPRs and the x87 stack. Declaring it
-            # here would shadow that global with a fresh zeroed local, so a
-            # value produced in one block and read in the next - a return
-            # value in xmm0, or a spill straddling a branch - would be lost.
-            if mmx_regs:
-                lines.append(f"    uint64_t {', '.join(mmx_regs)};")
+        # SSE and MMX are architectural state, declared globally by the
+        # runtime exactly like the GPRs and the x87 stack. Declaring either
+        # here would shadow the global with a fresh zeroed local, so a value
+        # produced in one block and read in the next -- a return value in
+        # xmm0, an mm register carried across a branch -- would be lost.
+        #
+        # MMX used to get `uint64_t mm0, mm1, ...` here, from before the
+        # instructions were implemented and the registers were only ever
+        # written. With mm0..mm7 now real globals, that declaration expands
+        # through the `#define mm0 g_mm0` alias into a local named g_mm0 that
+        # shadows the register it is meant to be.
 
         # The x87 stack is architectural state and survives guest calls. Some
         # detector boundaries also split one original CRT helper into several
         # generated C functions, so function-local storage loses live ST values.
         if has_fpu:
-            lines.append(f"    #define fp_push(v) do {{ double _fp_value = (v); \\")
-            lines.append(f"        g_fp_top = (g_fp_top + 7u) & 7u; \\")
-            lines.append(f"        g_fp_stack[g_fp_top] = _fp_value; }} while (0)")
-            lines.append(f"    #define fp_pop() (g_fp_top = (g_fp_top + 1u) & 7u)")
-            lines.append(f"    #define fp_top() g_fp_stack[g_fp_top]")
-            lines.append(f"    #define fp_st(i) g_fp_stack[(g_fp_top + (i)) & 7u]")
-            lines.append(f"    #define fp_st1() fp_st(1)")
+            lines.extend(FP_STACK_MACROS)
 
         # For fpo_leaf functions that use ebp: initialize from g_seh_ebp.
         # In x86, these functions inherit EBP from their caller (typically
@@ -1255,40 +2220,88 @@ class FunctionTranslator:
         for insn in instructions:
             if insn.jump_target and start <= insn.jump_target < end:
                 label_addrs.add(insn.jump_target)
-        # Add switch table targets (indirect jmp with intra-function table)
-        for insn in instructions:
-            if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
-                switch_targets = self.lifter._analyze_switch_table(insn.operands)
-                for t in switch_targets:
-                    label_addrs.add(t)
+        label_addrs |= self.lifter.imm_code_refs
+        label_addrs.update(debug_slide_bypasses.values())
+        label_addrs.update(switch_leaders)
 
-        flag_state = None
-        self.lifter.cross_block_carry = carry_crosses_blocks(self.lifter, blocks)
-        # A direct local jump can enter a conditional block whose flags come
-        # from that jump's source. Address-order emission would otherwise
-        # thread the later fallthrough block's flag state into the join.
-        threaded_jumps = {}
-        blocks_by_start = {bb.start: bb for bb in blocks}
-        predecessors = {bb.start: 0 for bb in blocks}
-        for bb in blocks:
+        # Which blocks can reach each block. Flag state has to follow control
+        # flow, not address order: an optimising compiler routinely lets a jcc
+        # consume a `cmp` from a block that is not its immediate predecessor in
+        # memory. Threading the state linearly then hands that jcc the flags of
+        # whatever instruction happens to sit above it -- silently, and with a
+        # perfectly plausible-looking condition.
+        preds = {bb.start: set() for bb in blocks}
+        for i, bb in enumerate(blocks):
+            last = bb.instructions[-1] if bb.instructions else None
+            if last is None:
+                continue
+            bypass = debug_slide_bypasses.get(last.address)
+            if bypass in preds:
+                preds[bypass].add(bb.start)
+                continue
             for successor in bb.successors:
-                if successor in predecessors:
-                    predecessors[successor] += 1
-        for bb in blocks:
-            last = bb.last_insn
-            if not last or last.mnemonic != "jmp":
-                continue
-            target = last.jump_target
-            if target is None or not (start <= target < end):
-                continue
-            if predecessors.get(target, 0) < 2:
-                continue
-            target_bb = blocks_by_start.get(target)
-            if (target_bb and target_bb.instructions
-                    and target_bb.instructions[0].is_cond_jump
-                    and target_bb.instructions[0].end_address < end
-                    and target_bb.instructions[0].end_address in blocks_by_start):
-                threaded_jumps[last.address] = target_bb.instructions[0]
+                if successor in preds:
+                    preds[successor].add(bb.start)
+            if last.jump_target in preds:
+                preds[last.jump_target].add(bb.start)
+            # A conditional jump also falls through; ret and an unconditional
+            # jmp do not.
+            leaves = (last.is_ret or last.mnemonic in (
+                "jmp", "ud2", "hlt", "iret", "iretd")
+                      or (last.mnemonic == "int3"
+                          and last.address not in debug_slide_int3s))
+            if not leaves and i + 1 < len(blocks):
+                preds[blocks[i + 1].start].add(bb.start)
+
+        # Settle the flag state before emitting anything.
+        #
+        # Blocks are walked in address order, so the predecessor on a back
+        # edge sits *after* the block it reaches and has no out-state on a
+        # first pass. The join then sees an unknown predecessor and gives up,
+        # which is safe but costly: the jcc at the top of a counted loop is
+        # exactly that shape, and it lifts to the `_flags` fallback -- a
+        # variable nothing assigns, so the branch compiles as never taken and
+        # the loop has no exit.
+        #
+        # Iterating to a fixed point fixes it. A block's out-state depends on
+        # its own instructions unless it has no flag setter at all, in which
+        # case it passes its incoming state through, so the pass converges;
+        # three rounds is more than any real loop nest needs. The lines are
+        # discarded here, only the out-states are kept.
+        #
+        # lift_basic_block accumulates two things on the Lifter across calls.
+        # referenced_calls is a dict keyed by address, so re-lifting a block
+        # rewrites the same entries. unimplemented appends, and its counts are
+        # a report about the title rather than about how many times the lifter
+        # ran, so they are saved and restored around the probe.
+        # Without a back edge, address order already visits every predecessor
+        # before the block it reaches, so the emit pass settles the state as
+        # it goes and the probe would only repeat its work. Aliasing
+        # settled_state onto the dict that pass fills is what makes the two
+        # cases one loop: it then reads exactly the states it has computed
+        # itself, which is what this function did before the probe existed.
+        out_state = {}
+        settled_state = out_state
+        if any(p >= bb.start for bb in blocks for p in preds[bb.start]):
+            saved_unimplemented = {
+                k: list(v) for k, v in self.lifter.unimplemented.items()
+            }
+            for _ in range(3):
+                changed = False
+                for bb in blocks:
+                    incoming = _incoming_flag_state(
+                        preds[bb.start], out_state, bb.start == start)
+                    _, new_out = lift_basic_block(
+                        self.lifter, bb, flag_state=incoming)
+                    if out_state.get(bb.start) != new_out:
+                        out_state[bb.start] = new_out
+                        changed = True
+                if not changed:
+                    break
+            self.lifter.unimplemented.clear()
+            self.lifter.unimplemented.update(saved_unimplemented)
+            settled_state = out_state
+            out_state = {}
 
         for bb in blocks:
             # Emit label if this block is a branch target
@@ -1300,26 +2313,42 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Propagate flag state from previous block (fallthrough path).
-            # This handles patterns like: test eax,eax / ja X / jb Y
-            # where jb uses the same flags as ja from the preceding block.
-            stmts, flag_state = lift_basic_block(
-                self.lifter, bb, flag_state=flag_state,
-                threaded_jumps=threaded_jumps)
+            # Inherit agreed state, including compatible CMP/TEST snapshots
+            # whose source operands differ between predecessor paths. The
+            # states come from the pre-pass above, so a back edge's
+            # predecessor is known here even though it sits later in address
+            # order.
+            incoming = _incoming_flag_state(preds[bb.start], settled_state,
+                                            bb.start == start)
+
+            stmts, out_state[bb.start] = lift_basic_block(
+                self.lifter, bb, flag_state=incoming)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
+            bypass = debug_slide_bypasses.get(bb.last_insn.address)
+            if bypass is not None:
+                lines.append(
+                    f"    goto loc_{bypass:08X}; /* int 0x2d skips slide int3 */")
+            if (start in self.coalesced_function_starts
+                    and (bb.last_insn.mnemonic in ("ud2", "hlt")
+                         or (bb.last_insn.mnemonic == "int3"
+                             and bb.last_insn.address not in debug_slide_int3s))):
+                lines.append("    return; /* trap ends recovered control flow */")
 
             lines.append(f"")
 
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:
+            if fallthrough_target in debug_slide_bypasses.values():
+                lines.append(f"loc_{fallthrough_target:08X}: ;")
             ft_name = self.lifter._call_target_name(fallthrough_target)
             lines.append(f"    g_seh_ebp = ebp; {ft_name}(); return;"
                          f" /* fallthrough 0x{fallthrough_target:08X} */")
             lines.append(f"")
 
         # Insert _icall_esp save points before RECOMP_ICALL_SAFE arg pushes.
-        # The pattern is: optional PUSH32 args, then PUSH32(esp, 0); RECOMP_ICALL_SAFE(...).
+        # The pattern is: optional PUSH32 args, then
+        # PUSH32(esp, <retva>); RECOMP_ICALL_SAFE(...).
         # We insert "uint32_t _icall_esp = g_esp;" before the first arg push.
         lines = _fixup_icall_esp_save(lines)
 
@@ -1363,11 +2392,7 @@ class FunctionTranslator:
 
         # Undefine FPU macros
         if has_fpu:
-            lines.append(f"    #undef fp_push")
-            lines.append(f"    #undef fp_pop")
-            lines.append(f"    #undef fp_top")
-            lines.append(f"    #undef fp_st")
-            lines.append(f"    #undef fp_st1")
+            lines.extend(FP_STACK_UNDEFS)
 
         lines.append(f"}}")
         lines.append(f"")
@@ -1414,19 +2439,29 @@ class BatchTranslator:
 
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
-                 output_dir=None, recovery_json_path=None,
-                 manual_call_targets=None,
-                 manual_call_targets_sha256=None,
-                 seh_prolog=None, seh_epilog=None):
+                 output_dir=None, seh_prolog=None, seh_epilog=None,
+                 trace_functions=None, force_returns=None,
+                 coalesce_json_paths=None, protected_function_starts=None,
+                 icall_sites_json_path=None):
         self.xbe_path = xbe_path
+        # Per-site indirect-call targets. A saturated site reached more
+        # targets than the runtime records, so it is never guarded.
+        self.icall_sites = {}
+        if icall_sites_json_path and os.path.exists(icall_sites_json_path):
+            with open(icall_sites_json_path, "r") as f:
+                for key, rec in json.load(f).items():
+                    if rec.get("saturated"):
+                        continue
+                    self.icall_sites[int(key, 16)] = [
+                        int(t, 16) for t in rec.get("targets", [])]
         self.output_dir = output_dir or os.path.join(
             os.path.dirname(__file__), "output")
-        self.manual_call_targets = frozenset(manual_call_targets or ())
-        self.manual_call_targets_sha256 = manual_call_targets_sha256
 
         # Load XBE
         with open(xbe_path, "rb") as f:
             self.xbe_data = f.read()
+
+        self.title = xbe_title(self.xbe_data, xbe_path)
 
         # Load function database
         with open(func_json_path, "r") as f:
@@ -1438,30 +2473,10 @@ class BatchTranslator:
             func["_addr"] = addr
             if "end" in func:
                 func["end"] = int(func["end"], 16)
-            # The legacy authenticated bounds file records "external_entry":
-            # true on every entry, including mid-function branch targets the
-            # runtime has proven are not real entries (0x985BD is reached
-            # only by a conditional jump from inside 0x98570). Treat that
-            # field as absent for such bounds, which coalescence is
-            # explicitly allowed to correct.
-            if func.get("detection_method") == "authenticated_prior_bounds":
-                func["external_entry"] = False
-                func["seed_derived"] = True
-            if "seed" in str(func.get("detection_method", "")):
-                func["seed_derived"] = True
-                func["external_entry"] = False
-                func["has_prologue"] = bool(func.get("has_prologue")) and False
-                func["called_by"] = []
             self.func_db[addr] = func
 
         # Load labels
-        self.label_db = {}
-        if labels_json_path and os.path.exists(labels_json_path):
-            with open(labels_json_path, "r") as f:
-                labels = json.load(f)
-            for lbl in labels:
-                addr = int(lbl["address"], 16)
-                self.label_db[addr] = lbl["name"]
+        self.label_db = load_label_db(labels_json_path)
 
         # Load classifications
         self.classification_db = {}
@@ -1481,163 +2496,60 @@ class BatchTranslator:
                 addr = int(entry["address"], 16)
                 self.abi_db[addr] = entry
 
-        # Detect the SEH helpers once here rather than per-Lifter, so the
-        # result can be reported and overridden from the command line.
-        if seh_prolog is None or seh_epilog is None:
-            found_prolog, found_epilog = detect_seh_helpers(
-                self.func_db, self.xbe_data, verbose=True)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
-            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
-        self.seh_prolog = seh_prolog
-        self.seh_epilog = seh_epilog
-
-        # Create translator
+        # Recover boundaries before identifying helpers from complete bodies.
         self.translator = FunctionTranslator(
             self.xbe_data, self.func_db, self.label_db,
             self.classification_db, self.abi_db,
-            manual_call_targets=self.manual_call_targets,
-            seh_prolog=seh_prolog, seh_epilog=seh_epilog)
-        self.translator.recover_external_cfgs()
-        self.translator.discover_static_indirect_targets()
-        if recovery_json_path:
-            recovery_json_paths = (
-                [recovery_json_path]
-                if isinstance(recovery_json_path, (str, os.PathLike))
-                else recovery_json_path)
-            entries = []
-            for path in recovery_json_paths:
-                with open(path, "r") as recovery_file:
-                    recovery_list = json.load(recovery_file)
-                for entry in recovery_list:
-                    parsed = {
-                        "start": int(entry["start"], 16),
-                        "end": int(entry["end"], 16),
-                    }
-                    if "coalesce_starts" in entry:
-                        parsed["coalesce_starts"] = [
-                            int(start, 16)
-                            for start in entry["coalesce_starts"]
-                        ]
-                    if "coalesce_bridges" in entry:
-                        parsed["coalesce_bridges"] = [
-                            int(start, 16)
-                            for start in entry["coalesce_bridges"]
-                        ]
-                    entries.append(parsed)
-            before = len(self.translator.recovered_function_starts)
-            self.translator.adopt_external_functions(entries)
-            adopted = (len(self.translator.recovered_function_starts) - before)
-            print(f"Adopted {adopted} of {len(entries)} externally analyzed "
-                  f"function bounds from {len(recovery_json_paths)} file(s)",
-                  file=sys.stderr)
+            seh_prolog=0, seh_epilog=0,
+            trace_functions=trace_functions,
+            force_returns=force_returns, icall_sites=self.icall_sites)
+        self.translator.protected_function_starts = set(
+            protected_function_starts or ())
+        for explicit_helper in (seh_prolog, seh_epilog):
+            if explicit_helper not in (None, 0):
+                self.translator.protected_function_starts.add(explicit_helper)
+        if coalesce_json_paths:
+            self.translator.discover_static_indirect_targets(coalescing=True)
+            for path in coalesce_json_paths:
+                for entry in load_coalescences(path):
+                    self.translator.coalesce_function(
+                        entry["start"], entry["end"], entry["coalesce_starts"])
+                    self.translator.discover_static_indirect_targets(
+                        coalescing=True)
+
+        helper_func_db = {
+            addr: info for addr, info in self.func_db.items()
+            if info.get("detection_method") != "static_indirect_table"
+        }
+
+        # Detect once here so the result can be reported and overridden from
+        # the command line without retaining an address of a removed fragment.
+        if seh_prolog is None or seh_epilog is None:
+            found_prologs, found_epilog = detect_seh_helpers(
+                helper_func_db, self.xbe_data, verbose=True)
+            seh_prolog = seh_prolog if seh_prolog is not None else found_prologs
+            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
+        seh_prologs = tuple(sorted(_as_addr_set(seh_prolog)))
+        self.seh_prolog = (None if not seh_prologs else
+                           seh_prologs[0] if len(seh_prologs) == 1 else
+                           seh_prologs)
+        self.seh_epilog = seh_epilog
+
+        setjmp_fn, longjmp_fn = detect_setjmp_helpers(
+            helper_func_db, self.xbe_data, verbose=True)
+
+        seh_prologs = frozenset(seh_prologs)
+        self.translator.lifter.SEH_PROLOGS = seh_prologs
+        self.translator.lifter.SEH_PROLOG = min(seh_prologs) if seh_prologs else None
+        self.translator.lifter.SEH_EPILOG = seh_epilog
+        self.translator.lifter.SEH_HELPERS = seh_prologs | (
+            {seh_epilog} if seh_epilog is not None else set())
+        self.translator.lifter.SETJMP_FN = setjmp_fn
+        self.translator.lifter.LONGJMP_FN = longjmp_fn
+        if not coalesce_json_paths:
+            self.translator.discover_static_indirect_targets()
         self.translator.discover_cfg_ownership()
-        arms = self.translator.discover_jump_table_entries()
-        if arms:
-            print(f"Recovered {len(arms)} jump-table arm entries",
-                  file=sys.stderr)
-        unknown_targets = self.manual_call_targets.difference(self.func_db)
-        if unknown_targets:
-            formatted = ", ".join(
-                f"0x{target:08X}" for target in sorted(unknown_targets))
-            raise ValueError(f"Unknown manual-call targets: {formatted}")
-        owned_targets = self.manual_call_targets.intersection(
-            self.translator.owned_function_starts)
-        if owned_targets:
-            formatted = ", ".join(
-                f"0x{target:08X}" for target in sorted(owned_targets))
-            raise ValueError(
-                f"Manual-call targets are internal CFG blocks: {formatted}")
-
-    def _expected_manual_call_sites(self, function_starts):
-        """Census the selected direct calls present in the translated input.
-
-        Re-disassembles each translated function and records every direct
-        call whose target is selected. This is the independent expectation
-        the emitted receipts are compared against, so a call that was lifted
-        directly instead of rewritten is caught rather than merely counted.
-        """
-        expected = set()
-        for start in sorted(function_starts):
-            func_info = self.func_db.get(start)
-            if not func_info:
-                continue
-            recovered = self.translator._recovered_cfg.get(start)
-            end = recovered["end"] if recovered else func_info.get("end")
-            if not end:
-                end = start + func_info.get("size", 0)
-            if end <= start:
-                continue
-            if recovered:
-                instructions = recovered["instructions"]
-            else:
-                raw_bytes = self.translator._read_func_bytes(start, end)
-                if not raw_bytes:
-                    continue
-                instructions = self.translator.disasm.disassemble_function(
-                    raw_bytes, start, end)
-            for insn in instructions or ():
-                target = getattr(insn, "call_target", None)
-                if target is None and getattr(insn, "mnemonic", None) == "jmp":
-                    target = getattr(insn, "jump_target", None)
-                if target in self.manual_call_targets:
-                    expected.add((start, insn.address, target))
-        return expected
-
-    def _manual_call_rewrite_receipts(self, function_starts=None):
-        rewrites = sorted(set(self.translator.lifter.manual_call_rewrites))
-        if function_starts is None:
-            function_starts = self.translator.translated_function_starts
-        expected = self._expected_manual_call_sites(function_starts)
-        observed = set(rewrites)
-
-        # Fail closed on any disagreement: a selected call that stayed direct
-        # shows up as missing, an unselected rewrite shows up as unexpected.
-        missing = expected.difference(observed)
-        unexpected = observed.difference(expected)
-        if missing or unexpected:
-            def fmt(sites):
-                return ", ".join(
-                    f"caller=0x{caller:08X} callsite=0x{callsite:08X} "
-                    f"target=0x{target:08X}"
-                    for caller, callsite, target in sorted(sites))
-
-            detail = []
-            if missing:
-                detail.append(f"not rewritten: {fmt(missing)}")
-            if unexpected:
-                detail.append(f"unexpected rewrites: {fmt(unexpected)}")
-            raise RuntimeError(
-                "Manual-call rewrite census mismatch "
-                f"(expected {len(expected)}, emitted {len(observed)}); "
-                + "; ".join(detail))
-
-        receipts = []
-        for caller, callsite, target in rewrites:
-            receipt = {
-                "caller": f"0x{caller:08X}",
-                "callsite": f"0x{callsite:08X}",
-                "target": f"0x{target:08X}",
-            }
-            receipts.append(receipt)
-            print(
-                "Manual call rewrite: "
-                f"caller={receipt['caller']} "
-                f"callsite={receipt['callsite']} "
-                f"target={receipt['target']}",
-                file=sys.stderr)
-        print(
-            f"Manual call census: {len(receipts)} rewrites match "
-            f"{len(expected)} expected selected callsites",
-            file=sys.stderr)
-        return receipts
-
-    def _record_manual_call_stats(self, stats):
-        stats["manual_call_targets"] = [
-            f"0x{target:08X}" for target in sorted(self.manual_call_targets)]
-        stats["manual_call_targets_sha256"] = (
-            self.manual_call_targets_sha256)
-        stats["manual_call_rewrites"] = (
-            self._manual_call_rewrite_receipts())
+        self.translator.discover_jump_table_entries()
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
         """
@@ -1670,11 +2582,7 @@ class BatchTranslator:
         func_info = self.func_db.get(addr)
         if not func_info:
             return None
-        code = self.translator.translate_function(addr, func_info)
-        # Only this function was translated, so only its own selected calls
-        # can be expected; unrelated selected targets live elsewhere.
-        self._manual_call_rewrite_receipts(function_starts={addr})
-        return code
+        return self.translator.translate_function(addr, func_info)
 
     def translate_batch(self, func_list, output_file=None, max_funcs=None,
                         verbose=False):
@@ -1706,7 +2614,8 @@ class BatchTranslator:
 
         c_chunks = []
         c_chunks.append("/**")
-        c_chunks.append(" * Burnout 3: Takedown - Mechanically Translated Game Code")
+        c_chunks.append(f" * {_config.banner_name(getattr(self, 'title', None))}"
+                        f" - Mechanically Translated Game Code")
         c_chunks.append(f" * Generated by tools/recomp from original Xbox x86 code.")
         c_chunks.append(f" * Functions: {len(func_list)}")
         c_chunks.append(" */")
@@ -1719,7 +2628,7 @@ class BatchTranslator:
 
         # Forward declarations
         for addr, func_info in func_list:
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             decl = self._make_declaration(addr, name)
             c_chunks.append(f"{decl};")
         c_chunks.append("")
@@ -1728,7 +2637,7 @@ class BatchTranslator:
 
         # Translate each function
         for i, (addr, func_info) in enumerate(func_list):
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 100 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name} at 0x{addr:08X}...")
 
@@ -1746,8 +2655,6 @@ class BatchTranslator:
                 c_chunks.append(f"void {name}(void) {{ /* translation failed */ }}")
                 c_chunks.append("")
                 stats["failed"] += 1
-
-        self._record_manual_call_stats(stats)
 
         # Write output
         if output_file is None:
@@ -1791,7 +2698,7 @@ class BatchTranslator:
 
     def translate_batch_split(self, func_list, output_dir, chunk_size=1000,
                               header_name="recomp_funcs.h",
-                              prefix="recomp", verbose=False):
+                              prefix="recomp", verbose=False, manual=None):
         """
         Translate functions into multiple .c files + a shared header.
 
@@ -1802,6 +2709,12 @@ class BatchTranslator:
           ...
           output_dir/recomp_dispatch.c    - address -> function pointer table
 
+        manual: addresses the project implements by hand. Their bodies are not
+        emitted, so the hand-written definition is the one that links, but they
+        are still declared and still count as defined for stub purposes. This
+        is how a game replaces a recompiled XDK routine (a D3D8 entry point,
+        say) with one that drives the host runtime instead of the hardware.
+
         Returns dict with stats and list of generated files.
         """
         import sys
@@ -1810,6 +2723,13 @@ class BatchTranslator:
 
         func_list = [item for item in func_list
                      if item[0] not in self.translator.owned_function_starts]
+        manual = set(manual or ())
+        # Hand the set to the lifter so a *direct* call to a replaced
+        # function routes through recomp_lookup_manual too. Without this
+        # the override only took effect through a function pointer, and
+        # every direct caller silently reached the generated body.
+        self.translator.lifter.manual_functions = manual
+        manual_decls = {}
 
         # Translate all functions first, collecting results
         translations = []
@@ -1821,10 +2741,15 @@ class BatchTranslator:
         }
 
         for i, (addr, func_info) in enumerate(func_list):
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 500 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
                       file=sys.stderr)
+
+            if addr in manual:
+                # Hand-written elsewhere: declare it, emit nothing.
+                manual_decls[addr] = name
+                continue
 
             code = self.translator.translate_function(addr, func_info)
             if code:
@@ -1838,8 +2763,6 @@ class BatchTranslator:
                 translations.append((addr, name, stub))
                 stats["failed"] += 1
 
-        self._record_manual_call_stats(stats)
-
         # Any address called but never defined needs a stub, or the link fails.
         # These are almost all mid-function entry points the function detector
         # did not split out: a call lands a few bytes inside (or just past) a
@@ -1848,18 +2771,29 @@ class BatchTranslator:
         # reported and written to their own file rather than hidden among the
         # translated chunks.
         defined = {name for _, name, _ in translations}
+        defined |= set(manual_decls.values())   # hand-written, but defined
         unresolved = {
             addr: name
             for addr, name in self.translator.lifter.referenced_calls.items()
             if name not in defined
         }
         stats["unresolved_stubs"] = len(unresolved)
+        stats["manual_functions"] = len(manual_decls)
+        # Instructions the lifter has no translation for become a comment, and
+        # a comment is a silent no-op. Surfacing the tally is the difference
+        # between "bsf is unimplemented" being a line of build output and being
+        # a week of heap debugging.
+        stats["unimplemented"] = {
+            m: list(addrs)
+            for m, addrs in self.translator.lifter.unimplemented.items()
+        }
 
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)
         header_lines = [
             "/**",
-            " * Burnout 3: Takedown - Recompiled Function Declarations",
+            f" * {_config.banner_name(getattr(self, 'title', None))}"
+            f" - Recompiled Function Declarations",
             f" * {stats['translated']} functions, auto-generated by tools/recomp",
             " */",
             "",
@@ -1873,6 +2807,13 @@ class BatchTranslator:
             decl = self._make_declaration(addr, name)
             header_lines.append(f"{decl};")
 
+        if manual_decls:
+            header_lines.append("")
+            header_lines.append("/* Hand-written overrides (defined by the project) */")
+            for addr in sorted(manual_decls):
+                header_lines.append(
+                    f"void {manual_decls[addr]}(void);  /* 0x{addr:08X} */")
+
         if unresolved:
             header_lines.append("")
             header_lines.append("/* Unresolved call targets (stubbed) */")
@@ -1881,19 +2822,84 @@ class BatchTranslator:
 
         header_lines.extend(["", "#endif /* RECOMP_FUNCS_H */", ""])
 
-        with open(header_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(header_lines))
+        write_if_changed(header_path, "\n".join(header_lines))
+
+        # recomp_types.h goes with it.
+        #
+        # recomp_funcs.h includes it, and a quoted include searches the
+        # including file's own directory first, so putting it here is all it
+        # takes for the generated code to compile. It used to live only in
+        # templates/runtime/, which every new project discovered the same way:
+        # `error C1083: Cannot open include file: 'recomp_types.h'`, then a hunt
+        # through the tree. It is the runtime's register model, not something a
+        # project writes, so the pipeline should hand it over like everything
+        # else it generates.
+        #
+        # Refreshed every run, not written once.
+        #
+        # This first said "never overwritten, so a project's edits survive".
+        # That was wrong, and the cost is a link error with no obvious cause:
+        # the lifter and this header are two halves of one contract, so a
+        # lifter that starts emitting RECOMP_ATOMIC_CAS32 against a header
+        # from three weeks ago gives
+        #
+        #     LNK2019: unresolved external symbol RECOMP_ATOMIC_CAS32
+        #
+        # pointing at generated code that is perfectly correct. The Xbox
+        # Dashboard hit exactly that. It is not hypothetical elsewhere either:
+        # Bloodwake's and Burnout 3's copies had already drifted from the
+        # template by 641 and 983 lines.
+        #
+        # So it tracks the template, like the .c files do. A project that
+        # genuinely needs its own can put one earlier on the include path --
+        # gen/ is only found because recomp_funcs.h sits beside it.
+        types_dst = os.path.join(output_dir, "recomp_types.h")
+        types_src = os.path.join(os.path.dirname(__file__), "..", "..",
+                                 "templates", "runtime", "recomp_types.h")
+        try:
+            with open(types_src, "r", encoding="utf-8") as src:
+                want = src.read()
+            have = None
+            if os.path.exists(types_dst):
+                with open(types_dst, "r", encoding="utf-8") as dst:
+                    have = dst.read()
+            if have != want:
+                with open(types_dst, "w", encoding="utf-8") as dst:
+                    dst.write(want)
+                print("  %s recomp_types.h (runtime register model)"
+                      % ("refreshed" if have is not None else "wrote"),
+                      file=sys.stderr)
+        except OSError as e:
+            print(f"  WARNING: could not write recomp_types.h ({e}); copy "
+                  f"it from templates/runtime/ by hand or the build will "
+                  f"not find it", file=sys.stderr)
 
         # Split translations into chunks and write .c files
         generated_files = [header_path]
         chunks = [translations[i:i+chunk_size]
                   for i in range(0, len(translations), chunk_size)]
 
+        # Remove chunk files a previous, larger run left behind. Projects glob
+        # gen/*.c into their build, so a stale chunk keeps compiling: it still
+        # defines the functions it held last time, and the build fails with a
+        # wall of "redefinition; different basic types" pointing at generated
+        # code that looks perfectly correct. Nothing else cleans them, and the
+        # count only has to shrink once -- which it does the first time a
+        # detector fix changes how many functions are found.
+        for stale in sorted(glob.glob(os.path.join(output_dir,
+                                                   f"{prefix}_[0-9][0-9][0-9][0-9].c"))):
+            index = int(os.path.basename(stale)[len(prefix) + 1:-2])
+            if index >= len(chunks):
+                os.remove(stale)
+                if verbose:
+                    print(f"  removed stale chunk {os.path.basename(stale)}")
+
         for ci, chunk in enumerate(chunks):
             c_path = os.path.join(output_dir, f"{prefix}_{ci:04d}.c")
             c_lines = [
                 "/**",
-                f" * Burnout 3 - Recompiled code chunk {ci}",
+                f" * {_config.banner_name(getattr(self, 'title', None))}"
+                f" - Recompiled code chunk {ci}",
                 f" * Functions: {len(chunk)} "
                 f"(0x{chunk[0][0]:08X} - 0x{chunk[-1][0]:08X})",
                 " */",
@@ -1906,8 +2912,7 @@ class BatchTranslator:
             for addr, name, code in chunk:
                 c_lines.append(code)
 
-            with open(c_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(c_lines))
+            write_if_changed(c_path, "\n".join(c_lines))
             generated_files.append(c_path)
 
             if verbose:
@@ -1929,23 +2934,56 @@ class BatchTranslator:
                 f'#include "{header_name}"',
                 "",
             ]
+            stub_lines.append(
+                "/* Each stub consumes the return address its caller pushed,")
+            stub_lines.append(
+                " * exactly as a real 'ret' would. An empty body leaves esp 4 bytes")
+            stub_lines.append(
+                " * low, and the caller then reads every subsequent stack slot off by")
+            stub_lines.append(
+                " * one - which surfaces far from here, as corrupted callee-saved")
+            stub_lines.append(
+                " * registers or a garbage local. Args are not popped: the callee's")
+            stub_lines.append(
+                " * stdcall byte count is read from the target's own bytes where")
+            stub_lines.append(
+                " * they end in a `ret N` -- guessing cdecl there silently walks")
+            stub_lines.append(
+                " * esp off by N on every call. */")
+            stub_lines.append("")
             for addr in sorted(unresolved):
+                popped = self.translator._stub_ret_bytes(addr)
+                note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ /* 0x{addr:08X}: not detected */ }}"
+                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
 
-            with open(stub_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(stub_lines))
+            write_if_changed(stub_path, "\n".join(stub_lines))
             generated_files.append(stub_path)
 
             if verbose:
                 print(f"  Wrote {stub_path} ({len(unresolved)} stubs)",
                       file=sys.stderr)
 
-        # Generate dispatch table
+        # Generate dispatch table.
+        #
+        # Hand-written functions belong in it too. They are declare-only here,
+        # so they never reached `translations` and got no entry -- which means
+        # a *direct* call to one linked fine by symbol while an *indirect* call
+        # to the same address found nothing in recomp_lookup and was dropped.
+        # That is a silent hole, and it grows with every function a project
+        # implements natively: on Half-Life 2 it covered memcpy, memmove,
+        # _initterm and atexit. The header already declares them.
+        # Sorted by address: recomp_lookup binary-searches this array, so an
+        # appended entry would silently break every lookup past it.
+        dispatch_entries = sorted(
+            list(translations) + [(addr, name, None)
+                                  for addr, name in manual_decls.items()],
+            key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
-        self._write_dispatch_table(translations, dispatch_path, header_name)
+        self._write_dispatch_table(dispatch_entries, dispatch_path, header_name)
         generated_files.append(dispatch_path)
 
         stats["files"] = generated_files
@@ -1961,7 +2999,11 @@ class BatchTranslator:
         """
         lines = [
             "/**",
-            " * Burnout 3 - Recompiled Function Dispatch Table",
+            # getattr: the dispatch writer is exercised directly by tests
+            # that build no full translator, and a banner is not worth an
+            # AttributeError.
+            f" * {_config.banner_name(getattr(self, 'title', None))}"
+            f" - Recompiled Function Dispatch Table",
             f" * Maps {len(translations)} Xbox VAs to translated function pointers.",
             " * Auto-generated by tools/recomp",
             " */",
@@ -1969,6 +3011,7 @@ class BatchTranslator:
             "#define RECOMP_DISPATCH_H",
             f'#include "{header_name}"',
             '#include <stddef.h>',
+            '#include <stdlib.h>',
             "",
             "/* Generic function pointer type */",
             "typedef void (*recomp_func_t)(void);",
@@ -1984,16 +3027,75 @@ class BatchTranslator:
         for addr, name, _ in translations:
             lines.append(f"    {{ 0x{addr:08X}u, (recomp_func_t){name} }},")
 
+        addrs = [addr for addr, _, _ in translations]
+        flat_base = min(addrs) if addrs else 0
+        flat_span = (max(addrs) - flat_base + 1) if addrs else 0
+
         lines.extend([
             "};",
             "",
             f"static const size_t g_recomp_table_size = "
             f"{len(translations)};",
             "",
-            "/* Binary search for a function by Xbox VA */",
+            "/* ----------------------------------------------------------------",
+            " * Flat, directly-indexed dispatch.",
+            " *",
+            " * Microsoft's recompiler resolves an indirect branch with a single",
+            " * `jmp qword ptr [r9 + r8*8]` -- one indexed load off a table keyed",
+            " * by guest address, no compare and no miss path. This is that, in C.",
+            " *",
+            " * The binary search below is still here and still correct. It runs",
+            " * ~log2(n) iterations per indirect call, which for this title is",
+            f" * about {max(1, len(translations).bit_length())} branches every time the game calls through a",
+            " * vtable. The flat table turns that into a bounds check and a load.",
+            " *",
+            " * Costs 8 bytes per byte of guest code span. Allocated with calloc so",
+            " * the untouched middle stays uncommitted rather than resident.",
+            " *",
+            " * recomp_dispatch_init() is optional by design: if it is never called,",
+            " * or the allocation fails, recomp_lookup silently keeps using the",
+            " * binary search. Nothing else in the program has to know. That is also",
+            " * why this does not pre-fill manual overrides -- they cannot be",
+            " * enumerated portably, so RECOMP_ICALL still consults",
+            " * recomp_lookup_manual first and this only replaces the search it used",
+            " * to fall through to. Behaviour is identical by construction.",
+            " * ---------------------------------------------------------------- */",
+            "",
+            f"static const uint32_t g_flat_base = 0x{flat_base:08X}u;",
+            f"static const uint32_t g_flat_span = 0x{flat_span:08X}u;",
+            "static recomp_func_t *g_flat_table = NULL;",
+            "",
+            "int recomp_dispatch_init(void)",
+            "{",
+            "    size_t i;",
+            "    if (g_flat_table) return 1;          /* already built */",
+            "    if (!g_flat_span) return 0;",
+            "    g_flat_table = (recomp_func_t *)calloc(g_flat_span,",
+            "                                           sizeof(recomp_func_t));",
+            "    if (!g_flat_table) return 0;         /* keep the binary search */",
+            "    for (i = 0; i < g_recomp_table_size; i++) {",
+            "        g_flat_table[g_recomp_table[i].xbox_va - g_flat_base] =",
+            "            g_recomp_table[i].func;",
+            "    }",
+            "    return 1;",
+            "}",
+            "",
+            "size_t recomp_dispatch_flat_bytes(void)",
+            "{",
+            "    return g_flat_table ? (size_t)g_flat_span * sizeof(recomp_func_t) : 0;",
+            "}",
+            "",
+            "/* Flat index when built, binary search otherwise. */",
             "recomp_func_t recomp_lookup(uint32_t xbox_va)",
             "{",
-            "    size_t lo = 0, hi = g_recomp_table_size;",
+            "    size_t lo, hi;",
+            "    if (g_flat_table) {",
+            "        uint32_t off = xbox_va - g_flat_base;",
+            "        /* Unsigned: a VA below the base wraps to a huge offset and is",
+            "         * rejected by the same compare, so no separate lower bound. */",
+            "        return (off < g_flat_span) ? g_flat_table[off] : NULL;",
+            "    }",
+            "    lo = 0; hi = g_recomp_table_size;",
             "    while (lo < hi) {",
             "        size_t mid = lo + (hi - lo) / 2;",
             "        if (g_recomp_table[mid].xbox_va < xbox_va)",
@@ -2024,5 +3126,4 @@ class BatchTranslator:
             "",
         ])
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        write_if_changed(output_path, "\n".join(lines))

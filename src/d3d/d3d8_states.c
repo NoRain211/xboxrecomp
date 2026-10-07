@@ -23,10 +23,10 @@ static ID3D11DepthStencilState *g_ds_state = NULL;
 static ID3D11RasterizerState   *g_raster_state = NULL;
 static ID3D11SamplerState      *g_sampler_states[4] = { NULL, NULL, NULL, NULL };
 
-/* Last known render state hash for dirty detection */
+/* Last known render state identity for dirty detection */
 static DWORD g_last_blend_hash = 0;
-static DWORD g_last_ds_hash = 0;
 static DWORD g_last_raster_hash = 0;
+static D3D11_DEPTH_STENCIL_DESC g_last_ds_desc;
 
 /* ================================================================
  * D3D8 → D3D11 enum translation
@@ -47,6 +47,18 @@ static D3D11_BLEND d3d8_to_d3d11_blend(DWORD d3d8blend)
     case D3DBLEND_INVDESTCOLOR: return D3D11_BLEND_INV_DEST_COLOR;
     case D3DBLEND_SRCALPHASAT:  return D3D11_BLEND_SRC_ALPHA_SAT;
     default:                    return D3D11_BLEND_ONE;
+    }
+}
+
+/* D3D11 forbids color factors in the alpha channel. Use their alpha components. */
+static D3D11_BLEND blend_alpha_factor(D3D11_BLEND blend)
+{
+    switch (blend) {
+    case D3D11_BLEND_SRC_COLOR:      return D3D11_BLEND_SRC_ALPHA;
+    case D3D11_BLEND_INV_SRC_COLOR:  return D3D11_BLEND_INV_SRC_ALPHA;
+    case D3D11_BLEND_DEST_COLOR:     return D3D11_BLEND_DEST_ALPHA;
+    case D3D11_BLEND_INV_DEST_COLOR: return D3D11_BLEND_INV_DEST_ALPHA;
+    default:                       return blend;
     }
 }
 
@@ -102,17 +114,6 @@ static DWORD hash_blend_states(const DWORD *rs)
            (rs[D3DRS_COLORWRITEENABLE] << 16);
 }
 
-static DWORD hash_ds_states(const DWORD *rs)
-{
-    return rs[D3DRS_ZENABLE] ^
-           (rs[D3DRS_ZWRITEENABLE] << 2) ^
-           (rs[D3DRS_ZFUNC] << 4) ^
-           (rs[D3DRS_STENCILENABLE] << 8) ^
-           (rs[D3DRS_STENCILFUNC] << 10) ^
-           (rs[D3DRS_STENCILREF] << 14) ^
-           (rs[D3DRS_STENCILMASK] << 18);
-}
-
 static DWORD hash_raster_states(const DWORD *rs)
 {
     return rs[D3DRS_CULLMODE] ^
@@ -142,8 +143,8 @@ static void update_blend_state(const DWORD *rs)
     bd.RenderTarget[0].SrcBlend = d3d8_to_d3d11_blend(rs[D3DRS_SRCBLEND]);
     bd.RenderTarget[0].DestBlend = d3d8_to_d3d11_blend(rs[D3DRS_DESTBLEND]);
     bd.RenderTarget[0].BlendOp = d3d8_to_d3d11_blendop(rs[D3DRS_BLENDOP] ? rs[D3DRS_BLENDOP] : 1);
-    bd.RenderTarget[0].SrcBlendAlpha = bd.RenderTarget[0].SrcBlend;
-    bd.RenderTarget[0].DestBlendAlpha = bd.RenderTarget[0].DestBlend;
+    bd.RenderTarget[0].SrcBlendAlpha = blend_alpha_factor(bd.RenderTarget[0].SrcBlend);
+    bd.RenderTarget[0].DestBlendAlpha = blend_alpha_factor(bd.RenderTarget[0].DestBlend);
     bd.RenderTarget[0].BlendOpAlpha = bd.RenderTarget[0].BlendOp;
     bd.RenderTarget[0].RenderTargetWriteMask = (UINT8)(rs[D3DRS_COLORWRITEENABLE] & 0x0F);
 
@@ -154,17 +155,8 @@ static void update_blend_state(const DWORD *rs)
 
 static void update_depth_stencil_state(const DWORD *rs)
 {
-    DWORD hash = hash_ds_states(rs);
     D3D11_DEPTH_STENCIL_DESC dsd;
     HRESULT hr;
-
-    if (hash == g_last_ds_hash && g_ds_state) return;
-    g_last_ds_hash = hash;
-
-    if (g_ds_state) {
-        ID3D11DepthStencilState_Release(g_ds_state);
-        g_ds_state = NULL;
-    }
 
     memset(&dsd, 0, sizeof(dsd));
     dsd.DepthEnable = rs[D3DRS_ZENABLE] ? TRUE : FALSE;
@@ -181,9 +173,19 @@ static void update_depth_stencil_state(const DWORD *rs)
     dsd.FrontFace.StencilPassOp = d3d8_to_d3d11_stencilop(rs[D3DRS_STENCILPASS]);
     dsd.BackFace = dsd.FrontFace;
 
+    /* Zeroed padding makes the complete descriptor comparable; the reference
+     * is bound separately. */
+    if (g_ds_state && memcmp(&dsd, &g_last_ds_desc, sizeof(dsd)) == 0) return;
+    if (g_ds_state) {
+        ID3D11DepthStencilState_Release(g_ds_state);
+        g_ds_state = NULL;
+    }
+
     hr = ID3D11Device_CreateDepthStencilState(d3d8_GetD3D11Device(), &dsd, &g_ds_state);
     if (FAILED(hr))
         fprintf(stderr, "D3D8: CreateDepthStencilState failed: 0x%08lX\n", hr);
+    else
+        memcpy(&g_last_ds_desc, &dsd, sizeof(dsd));
 }
 
 static void update_rasterizer_state(const DWORD *rs)
@@ -322,7 +324,6 @@ void d3d8_states_shutdown(void)
         }
     }
     g_last_blend_hash = 0;
-    g_last_ds_hash = 0;
     g_last_raster_hash = 0;
 }
 

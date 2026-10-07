@@ -4,26 +4,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from .disasm import BasicBlock, Disassembler, Operand
-from .lifter import Lifter, _make_condition, lift_basic_block
+from .disasm import BasicBlock, Disassembler
+from .lifter import Lifter, lift_basic_block
+from .translator import FunctionTranslator
 
 
 def _lift(raw):
     instructions = Disassembler().disassemble_function(raw, 0, len(raw))
     lifter = Lifter()
     lifter.func_end = len(raw) + 1
+    lifter.needs_cf = FunctionTranslator._function_needs_cf(instructions)
     return "\n".join(lift_basic_block(
         lifter, BasicBlock(start=0, instructions=instructions))[0])
 
 
 class TestSignWidthTest(unittest.TestCase):
-    def test_dword_output_is_unchanged(self):
-        operands = [Operand(type="reg", reg="ecx")] * 2
-        self.assertEqual(_make_condition("js", "test", operands)[0],
-                         "TEST_S(ecx, ecx)")
-        self.assertEqual(_make_condition("jns", "test", operands)[0],
-                         "((int32_t)(ecx & ecx) >= 0)")
-
     def test_emitted_c_uses_test_operand_sign_bit(self):
         compiler = shutil.which("gcc") or shutil.which("clang")
         if compiler is None:
@@ -57,8 +52,6 @@ class TestSignWidthTest(unittest.TestCase):
                     clobber = "b900000000ba00000000be04000000" if deferred else ""
                     raw = bytes.fromhex(opcode + clobber + consumer_opcode)
                     lifted = _lift(raw)
-                    if deferred:
-                        self.assertIn("_flagsnap_", lifted)
                     if consumer.startswith("j"):
                         result = f"return 0; loc_{len(raw):08X}: return 1;"
                     else:
@@ -97,6 +90,7 @@ class TestSignWidthTest(unittest.TestCase):
             #include <stdint.h>
             #include <stdio.h>
             static uint32_t eax, ebx, ecx, edx, esi, memory[2];
+            static uint32_t _fa, _fb; static int32_t _fas, _fbs;
             #define LO8(x) ((uint8_t)(x))
             #define HI8(x) ((uint8_t)((x) >> 8))
             #define LO16(x) ((uint16_t)(x))

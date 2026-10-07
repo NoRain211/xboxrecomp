@@ -23,6 +23,7 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
+#include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
 
 /* ============================================================
  * Globals
@@ -58,6 +59,35 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
+/* Physical addresses, resolved the way every other bus master here does it
+ * (dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c).
+ *
+ * DirectSound builds its voice, SGE and notifier structures in
+ * MmAllocateContiguousMemory and hands the APU their physical addresses.
+ * Physical P and the contiguous window's 0x80000000 + P are the same bytes on
+ * hardware; here the window is separate storage. Reading every address as low
+ * RAM meant the voice processor walked zeroes and wrote each "voice done"
+ * notification into ordinary RAM, where DirectSound never looked -- so a
+ * buffer never reported that it had stopped, and Burnout 3's frontend waits
+ * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
+extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
+extern uint32_t xbox_ContiguousAllocatedBytes(void);
+
+uint8_t *mcpx_apu_phys(uint64_t addr)
+{
+    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return g_apu_ram_ptr + a;
+    if (a < xbox_ContiguousAllocatedBytes())
+        return g_apu_ram_ptr + 0x80000000u + a;
+    return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+}
+
+/* The interrupt line, as the frame thread sees it. update_irq used to call
+ * pci_irq_assert, which is an empty stub here, so DirectSound's service
+ * routine never ran and no voice completion ever reached it. */
+static volatile LONG s_irq_line;
+
 static void update_irq(MCPXAPUState *d)
 {
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
@@ -67,12 +97,91 @@ static void update_irq(MCPXAPUState *d)
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
-        /* In standalone mode we don't raise a PCI IRQ; the game's kernel
-         * stub will poll ISTS directly or we'll signal via a flag. */
-        pci_irq_assert(PCI_DEVICE(d));
+        InterlockedExchange(&s_irq_line, 1);
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
-        pci_irq_deassert(PCI_DEVICE(d));
+        InterlockedExchange(&s_irq_line, 0);
+    }
+}
+
+/* ---- delivering it ---------------------------------------------------- */
+
+/* HalGetInterruptVector(5) -- the APU's IRQ -- is what DirectSound connects
+ * its service routine to (0x002F8E81 in Burnout 3). */
+#define APU_VECTOR 5
+
+typedef void (*apu_guest_fn)(void);
+extern apu_guest_fn recomp_lookup(uint32_t xbox_va);
+extern int  xbox_worker_stack_alloc(void);
+extern void xbox_worker_stack_free(int slot);
+extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+extern uint32_t xbox_AllocThreadTib(void);
+extern int xbox_IrqlBlocksInterrupts(void);
+extern int xbox_IrqlEnterInterrupt(int level);
+extern void xbox_IrqlLeaveInterrupt(int saved);
+#if defined(_MSC_VER)
+#  define APU_TLS __declspec(thread)
+#else
+#  define APU_TLS __thread
+#endif
+extern APU_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
+extern APU_TLS uint32_t g_fs_base;
+
+/* Call the connected service routine while the line is up, from the frame
+ * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
+ * a worker stack for the call, a TIB of this thread's own, and a hold-off
+ * while a guest thread sits at raised IRQL, which is when the single-CPU
+ * console could not have taken the interrupt. The routine acknowledges by
+ * writing ISTS, which drops the line through update_irq. */
+static void apu_deliver_irq(MCPXAPUState *d)
+{
+    static int tib_ready;
+    static unsigned held_off;
+    uint32_t kint, routine, context;
+    apu_guest_fn fn;
+    int slot;
+
+    if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
+        return;
+    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
+        return;
+    held_off = 0;
+    kint = xbox_GetConnectedInterrupt(APU_VECTOR);
+    if (!kint)
+        return;
+    routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
+    context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
+    fn = routine ? recomp_lookup(routine) : NULL;
+    if (!fn)
+        return;
+    if (!tib_ready) {
+        uint32_t tib = xbox_AllocThreadTib();
+        if (!tib)
+            return;
+        g_fs_base = tib;
+        tib_ready = 1;
+    }
+    slot = xbox_worker_stack_alloc();
+    if (slot < 0)
+        return;
+
+    qemu_mutex_unlock(&d->lock);
+    g_esp = XBOX_WORKER_STACK_TOP(slot);
+    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    xbox_worker_stack_free(slot);
+    qemu_mutex_lock(&d->lock);
+
+    {
+        static unsigned n;
+        if (n++ < 3) {
+            fprintf(stderr, "[APU] interrupt delivered to 0x%08X -> %s\n",
+                    routine, (g_eax & 1) ? "claimed" : "declined");
+            fflush(stderr);
+        }
     }
 }
 
@@ -124,6 +233,32 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
         qatomic_set(&d->regs[addr], (uint32_t)val);
+        /* Starting the APU has to start the frame thread.
+         *
+         * The thread idles on pause_requested, which init sets and only the
+         * test tone ever cleared -- so a title that enabled the APU through
+         * these registers got an APU that stayed asleep. Nothing then advanced
+         * the front end, and a title waiting on a notify completion (the
+         * FEMEMDATA magic write, which is how completion reaches guest memory)
+         * waited forever. Wreckless hangs exactly there during DirectSound
+         * init, and because it initialises its whole engine behind a
+         * successful DirectSound create, that hang is not confined to audio.
+         *
+         * Resume whenever the write is not switching the block off; the thread
+         * re-checks FECTL itself and idles again if it is halted or trapped. */
+        {
+            uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+            uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+            bool running =
+                ((sectl & NV_PAPU_SECTL_XCNTMODE) != NV_PAPU_SECTL_XCNTMODE_OFF)
+                && ((fectl & NV_PAPU_FECTL_FEMETHMODE)
+                    != NV_PAPU_FECTL_FEMETHMODE_HALTED);
+            if (running && d->pause_requested) {
+                d->pause_requested = false;
+                fprintf(stderr, "[APU] started by the title"
+                                " (SECTL=%08X FECTL=%08X)\n", sectl, fectl);
+            }
+        }
         qemu_cond_broadcast(&d->cond);
         break;
     case NV_PAPU_FEMEMDATA:
@@ -425,6 +560,13 @@ static void *mcpx_apu_frame_thread(void *arg)
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
         throttle(d);
 
+        /* The doorbell ack stands in for the GP DSP, which on hardware runs
+         * whatever the front end is doing. Tying it to se_frame stopped it
+         * whenever FECTL was trapped or halted, and DirectSound then waits
+         * forever to post its next command: Burnout 3 stalls in
+         * sub_002F805E polling the same doorbell it was acked on at init. */
+        mcpx_apu_dsp_ack_poll(d);
+
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -440,6 +582,30 @@ static void *mcpx_apu_frame_thread(void *arg)
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
+
+        /* What xemu's frame thread does after each frame: turn a pending
+         * notification (set by the voice processor or a trapped method) into
+         * the interrupt line. Nothing here ever did, so the line never rose
+         * even before there was anything to deliver it to. */
+        if (d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+        }
+        apu_deliver_irq(d);
+
+        /* Let the guest in once per frame.
+         *
+         * The thread holds d->lock for its whole loop and only drops it inside
+         * throttle()'s wait. Once voices really play, processing can run
+         * behind real time, throttle never waits, and the lock is never
+         * released -- while every VOICE_ON/OFF/RELEASE the title writes needs
+         * it (voice_lock). A critical section is not fair, so the title's
+         * thread starved there indefinitely: Burnout 3 froze on its vehicle
+         * select, blocked in voice_lock at raised IRQL, which in turn held
+         * off every USB interrupt. */
+        qemu_mutex_unlock(&d->lock);
+        SwitchToThread();
+        qemu_mutex_lock(&d->lock);
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -698,7 +864,7 @@ void apu_mixer_free_voice(int slot)
 {
     if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
     EnterCriticalSection(&g_mixer_cs);
-    g_mixer_voices[slot].active = 0;
+    apu_mixer_stop(slot);
     g_mixer_voices[slot].pcm_data = NULL;
     g_mixer_voices[slot].pcm_bytes = 0;
     g_mixer_voices[slot].play_offset = 0;
@@ -711,25 +877,49 @@ APUMixerVoice *apu_mixer_get_voice(int slot)
     return &g_mixer_voices[slot];
 }
 
+int apu_mixer_set_position(int slot, uint32_t byte_offset)
+{
+    if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return 0;
+    EnterCriticalSection(&g_mixer_cs);
+    APUMixerVoice *v = &g_mixer_voices[slot];
+    uint32_t frame_bytes = v->num_channels * sizeof(int16_t);
+    int valid = (v->num_channels == 1 || v->num_channels == 2) &&
+                byte_offset < v->pcm_bytes &&
+                byte_offset / frame_bytes < v->pcm_bytes / frame_bytes;
+    if (valid) v->play_offset = ((uint64_t)(byte_offset / frame_bytes)) << 16;
+    LeaveCriticalSection(&g_mixer_cs);
+    return valid;
+}
+
+void apu_mixer_get_state(int slot, uint32_t *byte_offset, int *active, int *looping)
+{
+    if (byte_offset) *byte_offset = 0;
+    if (active) *active = 0;
+    if (looping) *looping = 0;
+    if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
+    EnterCriticalSection(&g_mixer_cs);
+    APUMixerVoice *v = &g_mixer_voices[slot];
+    if (byte_offset) *byte_offset = (uint32_t)(v->play_offset >> 16) *
+                                    v->num_channels * sizeof(int16_t);
+    if (active) *active = v->active;
+    if (looping) *looping = v->active && v->looping;
+    LeaveCriticalSection(&g_mixer_cs);
+}
+
 void apu_mixer_play(int slot, int looping)
 {
     if (g_audio_muted) return;
     if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
+    EnterCriticalSection(&g_mixer_cs);
     APUMixerVoice *v = &g_mixer_voices[slot];
-    if (!v->pcm_data || v->pcm_bytes == 0) return;
-    v->looping = looping;
-    v->play_offset = 0;
-    v->active = 1;
-    InterlockedIncrement((volatile LONG *)&g_mixer_active_count);
-
-    /* Wake up APU thread if it was paused */
-    extern MCPXAPUState *g_state;
-    if (g_state) {
-        qemu_mutex_lock(&g_state->lock);
-        g_state->pause_requested = false;
-        qemu_cond_signal(&g_state->cond);
-        qemu_mutex_unlock(&g_state->lock);
+    if (!v->pcm_data || (v->num_channels != 1 && v->num_channels != 2) ||
+        v->pcm_bytes < v->num_channels * sizeof(int16_t)) {
+        LeaveCriticalSection(&g_mixer_cs);
+        return;
     }
+    v->looping = looping;
+    if (!v->active) InterlockedIncrement((volatile LONG *)&g_mixer_active_count);
+    v->active = 1;
 
     static int play_log_count = 0;
     if (play_log_count < 20) {
@@ -737,22 +927,35 @@ void apu_mixer_play(int slot, int looping)
                 slot, v->pcm_bytes, v->num_channels, v->sample_rate, v->volume, looping);
         play_log_count++;
     }
+    LeaveCriticalSection(&g_mixer_cs);
+
+    /* The frame thread takes the APU lock before the mixer lock. */
+    extern MCPXAPUState *g_state;
+    if (g_state) {
+        qemu_mutex_lock(&g_state->lock);
+        g_state->pause_requested = false;
+        qemu_cond_signal(&g_state->cond);
+        qemu_mutex_unlock(&g_state->lock);
+    }
 }
 
 void apu_mixer_stop(int slot)
 {
     if (slot < 0 || slot >= APU_MIXER_MAX_VOICES) return;
+    EnterCriticalSection(&g_mixer_cs);
     if (g_mixer_voices[slot].active) {
         g_mixer_voices[slot].active = 0;
         InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
     }
+    LeaveCriticalSection(&g_mixer_cs);
 }
 
 /* Mix all active voices into frame_buf. Called from mcpx_apu_monitor_frame.
- * play_offset is stored as a 16.16 fixed-point source frame position. */
+ * Keep 16 fractional bits in a wide offset so buffers can exceed 65536 frames. */
 static void mixer_render(int16_t frame_buf[][2], int num_samples)
 {
     if (!g_mixer_initialized) return;
+    EnterCriticalSection(&g_mixer_cs);
 
     for (int v = 0; v < APU_MIXER_MAX_VOICES; v++) {
         APUMixerVoice *voice = &g_mixer_voices[v];
@@ -764,8 +967,9 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
         if (total_frames == 0) continue;
 
         /* Fixed-point 16.16 increment per output sample */
-        uint32_t inc = (uint32_t)(((uint64_t)voice->sample_rate << 16) / 48000);
-        uint32_t pos = voice->play_offset; /* 16.16 fixed-point */
+        uint64_t inc = ((uint64_t)voice->sample_rate << 16) / 48000;
+        uint64_t pos = voice->play_offset;
+        uint64_t end = (uint64_t)total_frames << 16;
         float vol = voice->volume;
 
         for (int i = 0; i < num_samples; i++) {
@@ -773,9 +977,10 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
 
             if (src_frame >= total_frames) {
                 if (voice->looping) {
-                    pos = 0;
-                    src_frame = 0;
+                    pos %= end;
+                    src_frame = (uint32_t)(pos >> 16);
                 } else {
+                    pos = 0;
                     voice->active = 0;
                     InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
                     break;
@@ -807,11 +1012,13 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
         uint32_t end_frame = pos >> 16;
         if (end_frame >= total_frames) {
             if (voice->looping) {
-                voice->play_offset = 0;
+                voice->play_offset = pos % end;
             } else if (voice->active) {
+                voice->play_offset = 0;
                 voice->active = 0;
                 InterlockedDecrement((volatile LONG *)&g_mixer_active_count);
             }
         }
     }
+    LeaveCriticalSection(&g_mixer_cs);
 }

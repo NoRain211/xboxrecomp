@@ -6,7 +6,8 @@ import unittest
 from pathlib import Path
 
 from .disasm import Disassembler
-from .lifter import Lifter, carry_crosses_blocks, lift_basic_block
+from .lifter import Lifter, lift_basic_block
+from .translator import FunctionTranslator
 from .test_lifter_test_sign import _lift
 
 
@@ -20,6 +21,7 @@ class CasinoFlagsTest(unittest.TestCase):
             path.write_text("""
                 #include <stdint.h>
                 #include <assert.h>
+                static uint32_t _fa, _fb; static int32_t _fas, _fbs;
                 #define LO8(x) ((uint8_t)(x))
                 #define LO16(x) ((uint16_t)(x))
                 #define SET_LO8(x,v) ((x)=((x)&0xffffff00u)|(uint8_t)(v))
@@ -88,7 +90,7 @@ class CasinoFlagsTest(unittest.TestCase):
         blocks = disasm.build_basic_blocks(insns, 0, len(raw))
         lifter = Lifter()
         lifter.func_end = len(raw) + 1
-        lifter.cross_block_carry = carry_crosses_blocks(lifter, blocks)
+        lifter.needs_cf = FunctionTranslator._function_needs_cf(insns)
         lines, state = [], None
         for block in blocks:
             stmts, state = lift_basic_block(lifter, block, state)
