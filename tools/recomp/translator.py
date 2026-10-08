@@ -2303,7 +2303,8 @@ class FunctionTranslator:
                 and not (start <= insn.jump_target < end))
             for insn in instructions
         )
-        if has_tail_jump or fallthrough_target is not None:
+        if (has_tail_jump or fallthrough_target is not None
+                or any(insn.mnemonic == "call" for insn in instructions)):
             used_regs.add("ebp")
 
 
@@ -2486,7 +2487,7 @@ class FunctionTranslator:
         lines.append("    int _cf = g_eflags & 1u; /* incoming carry flag */")
         self.lifter.needs_cf = True
         self.lifter.flag_tags = flag_tags
-        self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
+        self.lifter.publishes_ebp = "ebp" in used_regs
 
         # SSE and MMX are architectural state, declared globally by the
         # runtime exactly like the GPRs and the x87 stack. Declaring either
