@@ -26,7 +26,7 @@ from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width,
-                     JOINED)
+                     JOINED, publish_flags)
 
 
 def _merge_flag_states(states):
@@ -69,7 +69,10 @@ def _incoming_flag_state(sources, known, is_entry):
     A predecessor with no computed state yet makes the result unknown rather
     than guessed: that costs a fallback condition and never a wrong one.
     """
-    if is_entry or not sources:
+    if is_entry:
+        return _merge_flag_states([("eflags", []),
+                                  *(known[p] for p in sources if p in known)])
+    if not sources:
         return None
     if not all(p in known for p in sources):
         return None
@@ -2196,6 +2199,20 @@ class FunctionTranslator:
                         and block.last_insn.mnemonic == "int3"
                         and block.last_insn.address not in debug_slide_int3s):
                     block.successors = []
+        # Linear decoding also sees inline tables and padding after returns.
+        # Only executable CFG edges (including the computed-edge census) can
+        # make those blocks part of this function.
+        by_start = {block.start: block for block in blocks}
+        reachable = set()
+        pending = [start]
+        while pending:
+            address = pending.pop()
+            if address in reachable or address not in by_start:
+                continue
+            reachable.add(address)
+            pending.extend(by_start[address].successors)
+        blocks = [block for block in blocks if block.start in reachable]
+        instructions = [insn for block in blocks for insn in block.instructions]
         return instructions, blocks
 
     def translate_function(self, func_addr, func_info):
@@ -2465,24 +2482,9 @@ class FunctionTranslator:
             lines.append("    double _fca = 0.0, _fcb = 0.0;")
             lines.append("    (void)_fca; (void)_fcb;")
 
-        # Add _cf for carry-dependent instructions.
-        #
-        # adc/sbb read CF directly, and so does a jb/jae whose flags came from
-        # arithmetic rather than a cmp -- the bit-stream decoders in the Xbox
-        # XCompress code are nothing but "add reg,reg" followed by jae, and a
-        # cmovb/cmovae after an add reads the same carry. Which setter a branch
-        # reads is the lifter's tracking rule, mirrored here so only the
-        # functions that consume CF declare it: computing it beside every add
-        # in the image would be a line per add in 48,000 functions.
-        # A tagged join may pick a carry condition this scan cannot see.
-        has_carry = self._function_needs_cf(instructions) or flag_tags
-        if has_carry:
-            lines.append(f"    int _cf = 0; /* carry flag */")
-        # Only functions that consume CF pay for producing it: an adc/sbb
-        # reading a never-written _cf silently drops every carry, which
-        # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
-        # idiom MSVC emits for odd trailing elements.
-        self.lifter.needs_cf = has_carry
+        # A caller may consume CF even when this function does not.
+        lines.append("    int _cf = g_eflags & 1u; /* incoming carry flag */")
+        self.lifter.needs_cf = True
         self.lifter.flag_tags = flag_tags
         self.lifter.publishes_ebp = self._func_owns_a_frame(instructions)
 
@@ -2644,6 +2646,8 @@ class FunctionTranslator:
 
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:
+            for stmt in publish_flags(out_state.get(blocks[-1].start)):
+                lines.append(f"    {stmt}")
             if fallthrough_target in debug_slide_bypasses.values():
                 lines.append(f"loc_{fallthrough_target:08X}: ;")
             ft_name = self.lifter._call_target_name(fallthrough_target)

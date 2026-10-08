@@ -12,7 +12,8 @@ def test_sar_width_and_carry_compiled():
     if not cc: pytest.skip('C compiler unavailable')
     code='''#include <stdint.h>
     #include <stdio.h>
-    static uint32_t eax,ecx,edx,esp;
+    static uint32_t eax,ecx,edx,esp,g_eflags;
+    #define RECOMP_PARITY8(v) (!__builtin_parity((unsigned char)(v)))
     #define LO8(v) ((uint8_t)(v))
     #define LO16(v) ((uint16_t)(v))
     #define SET_LO8(v,x) ((v)=((v)&0xffffff00u)|(uint8_t)(x))

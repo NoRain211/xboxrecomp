@@ -18,6 +18,6 @@ def translate_incdec(increment=False, below=False, byte=False):
 @pytest.mark.parametrize('byte',[False,True])
 def test_unsigned_condition_preserves_carry(increment,below,byte):
     code=translate_incdec(increment,below,byte)
-    assert 'int _cf = 0;' in code
+    assert 'int _cf = g_eflags & 1u;' in code
     assert 'if (_flags' not in code
     assert '_cf' in code[code.index('if ('):]
