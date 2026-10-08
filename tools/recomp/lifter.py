@@ -2185,7 +2185,7 @@ class Lifter:
             w = (_operand_width(ops[0]) or 4) * 8
             # Counts beyond a narrow operand have undefined CF, but the C
             # must stay defined. A masked zero preserves the incoming carry.
-            bit = f"({cnt}) - 1" if c_op == ">>" else f"({w} - ({cnt})) & 31u"
+            bit = f"(({cnt}) - 1) & 31u" if c_op == ">>" else f"({w} - ({cnt})) & 31u"
             out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({dst}) >> ({bit})) & 1u);")
         out.append(_fmt_operand_write(ops[0], f"(uint32_t)({dst}) {c_op} {cnt}"))
         out.append(self._result_snapshot(ops, "shift"))
@@ -2227,7 +2227,7 @@ class Lifter:
         signed = f"(int32_t)(int{width}_t)({dst})"
         out = []
         if self.needs_cf:
-            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> (({cnt}) - 1)) & 1);")
+            out.append(f"if ({cnt}) _cf = (int)(((uint32_t)({signed}) >> ((({cnt}) - 1) & 31u)) & 1);")
         out.append(_fmt_operand_write(ops[0], f"(uint32_t)(({signed}) >> {cnt})"))
         out.append(self._result_snapshot(ops, "sar"))
         return out

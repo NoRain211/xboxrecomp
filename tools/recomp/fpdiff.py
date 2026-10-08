@@ -370,6 +370,17 @@ def cases():
                     add(f"intops_{op}{width * 8}_{form}{count}", load
                         + [f"mov ecx, {count}", f"{op} {d}, {operand}",
                            "mov dword ptr [eax+32], edx", "mov eax, 0"], "sse")
+    for op in ("shl", "shr", "sar"):
+        for width, (d, _) in regs.items():
+            for count in (0, 1, 31, 32, 33, 255):
+                if op != "sar" and (count & 31) >= width * 8:
+                    continue  # CF is undefined at or above the operand width.
+                for form in ("imm", "cl"):
+                    operand = str(count) if form == "imm" else "cl"
+                    add(f"intops_carry_{op}{width * 8}_{form}{count}", load
+                        + [f"mov ecx, {count}", "stc", f"{op} {d}, {operand}",
+                           "setc cl", "movzx ecx, cl", "mov dword ptr [eax+32], edx",
+                           "mov dword ptr [eax+36], ecx", "mov eax, 0"], "sse")
     for op in ("mul", "imul"):
         for width, src in ((8, "bl"), (16, "bx"), (32, "ebx")):
             for source in (src, {8: "byte", 16: "word", 32: "dword"}[width]
