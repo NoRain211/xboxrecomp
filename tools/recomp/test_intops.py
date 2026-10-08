@@ -19,3 +19,4 @@ def test_intops_native(tmp_path, group):
     result = run(tmp_path, corpus)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "UNSUPPORTED" not in result.stdout, result.stdout
+    assert "C4293" not in (tmp_path / "compile.txt").read_text()
