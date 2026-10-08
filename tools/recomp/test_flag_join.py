@@ -61,3 +61,24 @@ def test_mixed_widths_pick_the_sign_bit_by_setter_tag():
     assert 'uint32_t _fk = 0;' in code, code
     assert code.count('/* flag setter tag */') >= 3, code
     assert '(_fk == 0x' in code, code
+
+def translate_or_join(consumer):
+    # test ecx,ecx; jz other; mov ecx,edx; or ecx,ebx; jmp join;
+    # other: or edx,ebx; join: consumer +1; inc eax; ret.
+    image = bytes.fromhex('85c9740689d109d9eb0209da') + consumer + bytes.fromhex('40c3')
+    config._install([config.Section('.text', BASE, len(image), 0, len(image), True)],
+                    entry_point=BASE, kernel_thunk_addr=BASE,
+                    origin='flag-join-test')
+    db = {BASE: {'start': hex(BASE), 'end': BASE + len(image),
+                 '_addr': BASE, 'size': len(image)}}
+    return FunctionTranslator(image, db).translate_function(BASE, db[BASE])
+
+def test_ors_into_different_registers_join_for_je():
+    # DOA3's title input logic ORs a pad mask into ecx on one path and edx
+    # on the other, then branches on ZF. Both results land in _fa, so the
+    # branch must test it; the never-taken fallback made the title act on
+    # a START that was not pressed.
+    for consumer, cond in (('7401', '(_fa == 0)'), ('7501', '(_fa != 0)')):
+        code = translate_or_join(bytes.fromhex(consumer))
+        assert f'if ({cond}) goto' in code, code
+        assert '_flags /* j' not in code, code
