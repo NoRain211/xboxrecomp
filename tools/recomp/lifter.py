@@ -4066,9 +4066,8 @@ def publish_flags(state, note="flags for pushfd"):
 
     Each flag comes from the condition a jcc on it would use (_make_condition),
     so the image and the branches agree, and a flag with no rule keeps the bit
-    g_eflags held. Only pushfd calls it: the flags stay lazy everywhere else,
-    and code that never pushes them pays nothing. A boundary that has to carry
-    the flags too (a call, a ret) can call it with its own note.
+    g_eflags held. pushfd calls it, and so do calls, rets and tail jumps, so
+    flags a callee returns in reach the caller's jcc.
     """
     if not state or state[0] == "eflags":
         return []
@@ -4118,8 +4117,17 @@ def lift_basic_block(lifter, bb, flag_state=None):
     while i < len(insns):
         curr = insns[i]
 
+        if (curr.is_call or curr.is_ret
+                or (curr.is_branch and (curr.jump_target is None
+                    or lifter._is_external_target(curr.jump_target)))):
+            stmts.extend(publish_flags(
+                (last_flag_setter, last_flag_ops) if last_flag_setter else None,
+                "flags across call boundary"))
+
         # Try cmp/test + jcc pattern first (2-instruction match)
-        match = try_match_cmp_jcc(insns, i, lifter=lifter)
+        match = (None if i + 1 < len(insns) and insns[i + 1].jump_target is not None
+                 and lifter._is_external_target(insns[i + 1].jump_target)
+                 else try_match_cmp_jcc(insns, i, lifter=lifter))
         if match:
             stmt, consumed = match
             flag_insn = insns[i]
@@ -4339,6 +4347,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # Additional flag-setting instructions
             last_flag_setter, last_flag_ops = normalise_zero_test(
                 curr.mnemonic, list(curr.operands))
+        elif curr.is_call:
+            last_flag_setter, last_flag_ops = "eflags", []
+            if lifter.needs_cf:
+                stmts.append("_cf = g_eflags & 1u; /* callee carry */")
         elif curr.mnemonic in _EFLAGS_PRESERVE:
             pass  # These don't affect EFLAGS
         elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
