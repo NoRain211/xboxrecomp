@@ -95,7 +95,7 @@ def test_direct_and_indirect_entries_execute_hook_before_body(monkeypatch, tmp_p
     db = {base: {'end': base + len(image), 'size': len(image)}}
     body = translator.FunctionTranslator(image, db).translate_function(base, db[base])
     source = '''#include <stdint.h>
-uint32_t eax, esp;
+uint32_t eax, esp, g_eflags;
 int hits, wrong_order;
 void sub_00010000_enter(void) { hits++; if(eax!=7) wrong_order++; }
 ''' + body + '''
