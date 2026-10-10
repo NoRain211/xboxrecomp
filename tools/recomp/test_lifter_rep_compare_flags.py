@@ -54,7 +54,8 @@ PRELUDE = r"""
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-static uint32_t eax, ecx, esi, edi, esp;
+static uint32_t eax, ecx, esi, edi, esp, g_eflags;
+#define RECOMP_PARITY8(v) (!__builtin_parity((unsigned char)(v)))
 static uint8_t mem[512];
 #define MEM8(a)  (*(uint8_t  *)(mem + (a)))
 #define MEM16(a) (*(uint16_t *)(mem + (a)))
@@ -188,10 +189,9 @@ def test_negative_control_without_the_zf_preload_a_zero_count_fails():
     assert "count 0" in ran.stderr, ran.stderr
 
 
-def test_cf_is_only_computed_where_the_function_reads_it():
-    # repe cmpsd; jne; ret -- the QueryInterface/GUID shape. Nothing reads
-    # CF, so _cf is neither declared nor written: 256 of JSRF's 259 rep
-    # compares are this, and they should cost nothing new.
+def test_cf_is_exported_even_without_a_local_consumer():
+    # A caller may consume the comparison's carry after this function returns.
     code = _translate("guid", bytes.fromhex("F3A77501C3C3"))
-    assert "_cf" not in code, code
+    assert "_cf = (MEM32(esi) < MEM32(edi));" in code, code
+    assert "g_eflags =" in code, code
     assert "_flags = (MEM32(esi) == MEM32(edi));" in code, code
