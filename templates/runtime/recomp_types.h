@@ -60,6 +60,26 @@
  * CMakeLists) -- MSVC's C4013 was emitted and discarded. Same failure as the
  * missing stdlib.h in kernel_bridge.c, in a hotter path. */
 #include <math.h>
+/* x87 transcendentals call the runtime's CRT-independent libm so results do
+ * not depend on the host's C runtime. Standalone harnesses with no runtime
+ * define RECOMP_CRT_MATH to use the CRT instead. */
+#ifdef RECOMP_CRT_MATH
+#define recomp_sin sin
+#define recomp_cos cos
+#define recomp_tan tan
+#define recomp_atan2 atan2
+#define recomp_log2 log2
+#define recomp_log1p log1p
+#define recomp_expm1 expm1
+#else
+double recomp_sin(double x);
+double recomp_cos(double x);
+double recomp_tan(double x);
+double recomp_atan2(double y, double x);
+double recomp_log2(double x);
+double recomp_log1p(double x);
+double recomp_expm1(double x);
+#endif
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
 #include <xmmintrin.h>
 #include <emmintrin.h>

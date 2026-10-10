@@ -3749,37 +3749,39 @@ class Lifter:
         # valid_real_matrix4x3: the matrix was built out of tangents that were
         # never computed, so it held whatever had been in those globals before.
         #
-        # These are exact-enough mappings onto libm. The 80-bit intermediates of
-        # real x87 are not reproduced -- fp_stack is double -- which is the same
-        # approximation every other op here already makes.
+        # These are exact-enough mappings onto the runtime's own libm. The 80-bit
+        # intermediates of real x87 are not reproduced -- fp_stack is double --
+        # which is the same approximation every other op here already makes.
+        # recomp_* rather than the host CRT, so every build computes the same
+        # bits: netplay and input replays depend on it.
         if m == "fsin":
-            return ["if (recomp_fp_trig_in_range(fp_top())) fp_top() = sin(fp_top()); /* fsin */"]
+            return ["if (recomp_fp_trig_in_range(fp_top())) fp_top() = recomp_sin(fp_top()); /* fsin */"]
         if m == "fcos":
-            return ["if (recomp_fp_trig_in_range(fp_top())) fp_top() = cos(fp_top()); /* fcos */"]
+            return ["if (recomp_fp_trig_in_range(fp_top())) fp_top() = recomp_cos(fp_top()); /* fcos */"]
         if m == "fsincos":
             # Replaces st0 with sin, then pushes cos. Order matters: the push
             # must see the sine already stored.
-            return [f"if (recomp_fp_trig_in_range(fp_top())) {{ double _a = fp_top(); fp_top() = sin(_a);"
-                    f" fp_push(cos(_a)); }} /* fsincos */"]
+            return [f"if (recomp_fp_trig_in_range(fp_top())) {{ double _a = fp_top(); fp_top() = recomp_sin(_a);"
+                    f" fp_push(recomp_cos(_a)); }} /* fsincos */"]
         if m == "fptan":
             # st0 = tan(st0), then push 1.0. The constant push is not decoration:
             # callers use it as the denominator of a subsequent fdiv.
             # An infinite or NaN operand pushes a NaN, not 1.0.
             return ["if (recomp_fp_trig_in_range(fp_top())) { double _a = fp_top();"
-                    " fp_top() = tan(_a); fp_push(isfinite(_a) ? 1.0 : _a - _a); } /* fptan */"]
+                    " fp_top() = recomp_tan(_a); fp_push(isfinite(_a) ? 1.0 : _a - _a); } /* fptan */"]
         if m == "fpatan":
             # st1 = atan2(st1, st0), pop. Argument order is st1 over st0.
-            return [f"{{ fp_st1() = atan2(fp_st1(), fp_top()); fp_pop(); }}"
+            return [f"{{ fp_st1() = recomp_atan2(fp_st1(), fp_top()); fp_pop(); }}"
                     f" /* fpatan */"]
         if m == "fyl2x":
             # st1 = st1 * log2(st0), pop.
-            return [f"{{ fp_st1() = fp_st1() * log2(fp_top()); fp_pop(); }}"
+            return [f"{{ fp_st1() = fp_st1() * recomp_log2(fp_top()); fp_pop(); }}"
                     f" /* fyl2x */"]
         if m == "fyl2xp1":
-            return [f"{{ fp_st1() = fp_st1() * (log1p(fp_top()) / 0.69314718055994530942); fp_pop(); }}"
+            return [f"{{ fp_st1() = fp_st1() * (recomp_log1p(fp_top()) / 0.69314718055994530942); fp_pop(); }}"
                     f" /* fyl2xp1 */"]
         if m == "f2xm1":
-            return ["fp_top() = expm1(fp_top() * 0.69314718055994530942); /* f2xm1 */"]
+            return ["fp_top() = recomp_expm1(fp_top() * 0.69314718055994530942); /* f2xm1 */"]
         if m in ("fprem", "fprem1"):
             return [f"fp_top() = recomp_fprem(fp_top(), fp_st1(), {int(m == 'fprem1')}); /* {m} */"]
         if m == "fscale":

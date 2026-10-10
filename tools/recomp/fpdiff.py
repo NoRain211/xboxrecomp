@@ -635,7 +635,7 @@ def run(out, corpus, include=None, prelude=None):
     (out / "lifted.c").write_text(source(prepared, prelude), newline="\n")
     include = include or Path(__file__).resolve().parents[2] / "templates" / "runtime"
     built = runner._cl(vcvars, str(out),
-                       f'/O2 /fp:strict /arch:SSE2 /I"{include}" lifted.c native.obj /Fecompare.exe')
+                       f'/O2 /fp:strict /arch:SSE2 /DRECOMP_CRT_MATH /I"{include}" lifted.c native.obj /Fecompare.exe')
     (out / "compile.txt").write_text(built.stdout + built.stderr)
     if built.returncode:
         raise RuntimeError(built.stdout + built.stderr)
