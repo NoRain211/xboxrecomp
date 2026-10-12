@@ -2316,7 +2316,9 @@ class FunctionTranslator:
         # make those blocks part of this function.
         by_start = {block.start: block for block in blocks}
         reachable = set()
-        pending = [start]
+        # Conservative immediate targets stay: an intra-function register jmp
+        # may reach them by a goto the CFG could not prove (_lift_jmp).
+        pending = [start, *imm_refs]
         while pending:
             address = pending.pop()
             if address in reachable or address not in by_start:

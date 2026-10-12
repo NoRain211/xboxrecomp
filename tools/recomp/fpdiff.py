@@ -330,6 +330,9 @@ def cases():
             return ["cmp esi, ebx", f"{op} {d}"], ()
         if op in ("adc", "sbb"):
             return ["shr esi, 1", f"{op} {d}, {s}"], ()
+        if op.endswith("_m1"):
+            # A narrow immediate, which the disassembler sign-extends to 32 bits.
+            return ["shr esi, 1", f"{op[:-3]} {d}, -1"], ()
         if op.endswith("_1") or op.endswith("_4"):
             name, count = op.split("_")
             return [f"{name} {d}, {count}"], (no_of if count != "1" else ())
@@ -344,7 +347,8 @@ def cases():
 
     ops = ("cmp", "test", "add", "sub", "and", "or", "xor", "adc", "sbb",
            "inc", "dec", "neg", "shl_1", "shr_1", "sar_1", "shl_4", "shr_4",
-           "sar_4", "imul", "cmp_imm", "test_self")
+           "sar_4", "imul", "cmp_imm", "test_self",
+           "add_m1", "sub_m1", "adc_m1", "sbb_m1")
     for op in ops:
         for width, (d, s) in regs.items():
             if op == "imul" and width == 1:

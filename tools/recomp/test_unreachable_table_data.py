@@ -18,3 +18,15 @@ def test_table_after_tail_is_not_lifted_but_switch_arms_are():
     assert '_flags /* jo' not in code
     instructions, _ = translator.decode_function(base, base + len(body))
     assert [i.address for i in instructions] == [base, base + 7, base + 8]
+
+
+def test_immediate_target_of_a_register_jmp_is_kept():
+    base = 0x10000
+    # mov ecx, base+0x10; call out (ecx is lost); jmp ecx; base+0x10: inc eax; ret
+    body = bytes.fromhex('b910000100e800010000ffe1').ljust(0x10, b'\xcc') + bytes.fromhex('40c3')
+    config._install([config.Section('.text', base, 0x200, 0, len(body), True)],
+                    entry_point=base, kernel_thunk_addr=base, origin='table-test')
+    info = {'start': hex(base), 'end': base + len(body), '_addr': base}
+    code = FunctionTranslator(body, {base: info}).translate_function(base, info)
+    assert 'if (_jt == 0x00010010u) goto loc_00010010;' in code, code
+    assert 'loc_00010010: ;' in code, code
