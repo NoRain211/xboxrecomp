@@ -14,7 +14,8 @@ def test_saved_incdec_result_compiled():
     if not cc: pytest.skip('C compiler unavailable')
     code='''#include <stdint.h>
 #include <stdio.h>
-static uint32_t eax,esp;
+static uint32_t eax,esp,g_eflags;
+#define RECOMP_PARITY8(v) (!__builtin_parity((unsigned char)(v)))
 #define LO8(v) ((uint8_t)(v))
 #define LO16(v) ((uint16_t)(v))
 #define ZX8(v) ((uint32_t)(uint8_t)(v))

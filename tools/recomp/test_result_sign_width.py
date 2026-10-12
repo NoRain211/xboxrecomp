@@ -40,7 +40,8 @@ def test_result_sign_uses_operand_width():
         pytest.skip('C compiler unavailable')
     code = '''#include <stdint.h>
 #include <stdio.h>
-static uint32_t eax,esp;
+static uint32_t eax,esp,g_eflags;
+#define RECOMP_PARITY8(v) (!__builtin_parity((unsigned char)(v)))
 #define LO8(v) ((uint8_t)(v))
 #define HI8(v) ((uint8_t)((v)>>8))
 #define LO16(v) ((uint16_t)(v))
