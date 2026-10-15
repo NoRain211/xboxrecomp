@@ -450,7 +450,7 @@ _EFLAGS_PRESERVE = frozenset({
     # pushfd READS the flags and leaves them alone, so it belongs here.
     # popfd does NOT -- see _FLAGS_UNDEFINED.
     "pushfd", "pushal",
-    "sgdt", "ljmp", "sfence",
+    "sgdt", "ljmp", "sfence", "wbinvd",
     # SSE scalar float
     "movss", "movsd",
     "addss", "subss", "mulss", "divss",
@@ -1729,6 +1729,11 @@ class Lifter:
         # in the unimplemented report as if they were missing work.
         if m.startswith("prefetch") or m in ("sfence", "lfence", "mfence"):
             return [f"(void)0; /* {m}: cache/ordering hint, nothing to model */"]
+
+        # The API-level host reads the same coherent memory as the guest CPU;
+        # no emulated CPU cache can hold dirty bytes away from those readers.
+        if m == "wbinvd":
+            return ["(void)0; /* wbinvd: coherent host memory, no separate guest cache */"]
 
         if m in ("stc", "clc", "cmc"):
             if not self.needs_cf:
