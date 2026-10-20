@@ -235,6 +235,11 @@ class Disassembler:
                                            point):
                 if cs_insn.address in decoded:
                     break          # rejoined a stream we already have
+                # The old misaligned stream can start inside this instruction
+                # and would otherwise run as part of the same block.
+                for addr in range(cs_insn.address + 1,
+                                  cs_insn.address + cs_insn.size):
+                    decoded.pop(addr, None)
                 decoded[cs_insn.address] = self._decode_instruction(cs_insn)
 
         return [decoded[a] for a in sorted(decoded)]
