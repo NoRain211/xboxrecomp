@@ -621,8 +621,8 @@ void recomp_trace_esp(const char *name, const char *tag);
 
 /* FSAVE's protected-mode image. Only state represented by the double-stack
  * model is restored: CW, TOP, condition codes and eight registers.
- * ponytail: tags, exception bits and instruction/data pointers are not modeled;
- * add explicit x87 environment tracking before relying on those image fields. */
+ * Tags, exception bits and the instruction/data pointers are not modeled; the
+ * image holds zeros there until the x87 environment is tracked. */
 static inline void recomp_fnsave(uint32_t address, int short_env) {
     unsigned stride = short_env ? 2u : 4u;
     unsigned env = 7u * stride;
