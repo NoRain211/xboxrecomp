@@ -116,6 +116,9 @@ _reg_names = {}
 # (start, size, new_start). Every immediate and displacement inside a moved
 # range is rebased, so all lifted readers and writers use the copy.
 DATA_RELOCATIONS = []
+# Instruction addresses whose operands only look like addresses inside a
+# moved range (an offset added to another base) and stay as they are.
+DATA_RELOCATION_KEEP = set()
 
 
 def relocate(value):
@@ -140,17 +143,20 @@ def _init_reg_names(cs):
 
 def _parse_operand(cs, cs_op, insn_obj):
     """Convert a Capstone operand to our Operand dataclass."""
+    keep = insn_obj.address in DATA_RELOCATION_KEEP
     if cs_op.type == CS_OP_IMM:
-        return Operand(type="imm", imm=relocate(cs_op.imm & 0xFFFFFFFF))
+        imm = cs_op.imm & 0xFFFFFFFF
+        return Operand(type="imm", imm=imm if keep else relocate(imm))
     elif cs_op.type == CS_OP_MEM:
         base = _reg_names.get(cs_op.mem.base) if cs_op.mem.base else None
         index = _reg_names.get(cs_op.mem.index) if cs_op.mem.index else None
+        disp = cs_op.mem.disp
         return Operand(
             type="mem",
             mem_base=base,
             mem_index=index,
             mem_scale=cs_op.mem.scale,
-            mem_disp=relocate(cs_op.mem.disp & 0xFFFFFFFF) if cs_op.mem.disp >= 0 else cs_op.mem.disp,
+            mem_disp=relocate(disp & 0xFFFFFFFF) if disp >= 0 and not keep else disp,
             mem_size=cs_op.size,
             mem_seg=(_reg_names.get(cs_op.mem.segment)
                      if getattr(cs_op.mem, "segment", 0) else None),

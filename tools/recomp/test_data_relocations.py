@@ -35,8 +35,12 @@ def test_moved_range_is_rebased():
         # small immediates and negative displacements are untouched
         assert _operands(bytes.fromhex("b812000000"))[1].imm == 0x12
         assert _operands(bytes.fromhex("8b45fc"))[1].mem_disp == -4
+        # lea edx, [eax + 0x29CA62] at a kept instruction: an offset, not a pointer
+        disasm.DATA_RELOCATION_KEEP.add(0x1000)
+        assert _operands(bytes.fromhex("8d9062ca2900"))[1].mem_disp == 0x29CA62
     finally:
         disasm.DATA_RELOCATIONS[:] = []
+        disasm.DATA_RELOCATION_KEEP.clear()
 
 
 if __name__ == "__main__":

@@ -274,7 +274,9 @@ def main():
                         help="JSON list of {from, size, to} guest data ranges "
                              "(hex strings) to move: every immediate and "
                              "displacement inside a range is rebased to 'to', "
-                             "for tables the runtime replaces with larger copies")
+                             "for tables the runtime replaces with larger copies; "
+                             "a {keep} entry names an instruction whose operands "
+                             "stay as they are")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -295,9 +297,12 @@ def main():
     if args.relocate_data:
         from . import disasm
         with open(args.relocate_data, "r", encoding="utf-8") as fh:
-            disasm.DATA_RELOCATIONS[:] = [
-                (int(r["from"], 16), int(r["size"], 16), int(r["to"], 16))
-                for r in json.load(fh)]
+            recipe = json.load(fh)
+        disasm.DATA_RELOCATIONS[:] = [
+            (int(r["from"], 16), int(r["size"], 16), int(r["to"], 16))
+            for r in recipe if "from" in r]
+        disasm.DATA_RELOCATION_KEEP.clear()
+        disasm.DATA_RELOCATION_KEEP.update(int(r["keep"], 16) for r in recipe if "keep" in r)
         print(f"Relocating {len(disasm.DATA_RELOCATIONS)} data ranges")
 
     # Find data files
