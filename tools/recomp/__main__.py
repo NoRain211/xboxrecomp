@@ -270,6 +270,11 @@ def main():
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
+    parser.add_argument("--relocate-data", metavar="JSON",
+                        help="JSON list of {from, size, to} guest data ranges "
+                             "(hex strings) to move: every immediate and "
+                             "displacement inside a range is rebased to 'to', "
+                             "for tables the runtime replaces with larger copies")
     parser.add_argument("--seh-prolog", metavar="ADDR",
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
@@ -286,6 +291,14 @@ def main():
 
     if args.game_name:
         config.set_game_name(args.game_name)
+
+    if args.relocate_data:
+        from . import disasm
+        with open(args.relocate_data, "r", encoding="utf-8") as fh:
+            disasm.DATA_RELOCATIONS[:] = [
+                (int(r["from"], 16), int(r["size"], 16), int(r["to"], 16))
+                for r in json.load(fh)]
+        print(f"Relocating {len(disasm.DATA_RELOCATIONS)} data ranges")
 
     # Find data files
     data_files = find_data_files(
