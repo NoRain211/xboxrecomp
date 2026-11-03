@@ -65,6 +65,34 @@
 #include <emmintrin.h>
 #endif
 
+/* The x87 transcendentals (fsin, fcos, fptan, fpatan, fyl2x, fyl2xp1, f2xm1).
+ * Hosts' libm need not agree in the last bit, so a project that compares
+ * guest state across machines, such as netplay, defines RECOMP_PORTABLE_MATH
+ * and links one implementation of these for every host. */
+#ifdef RECOMP_PORTABLE_MATH
+#ifdef __cplusplus
+extern "C" {
+#endif
+double recomp_sin(double x);
+double recomp_cos(double x);
+double recomp_tan(double x);
+double recomp_atan2(double y, double x);
+double recomp_log2(double x);
+double recomp_log1p(double x);
+double recomp_expm1(double x);
+#ifdef __cplusplus
+}
+#endif
+#else
+static inline double recomp_sin(double x) { return sin(x); }
+static inline double recomp_cos(double x) { return cos(x); }
+static inline double recomp_tan(double x) { return tan(x); }
+static inline double recomp_atan2(double y, double x) { return atan2(y, x); }
+static inline double recomp_log2(double x) { return log2(x); }
+static inline double recomp_log1p(double x) { return log1p(x); }
+static inline double recomp_expm1(double x) { return expm1(x); }
+#endif
+
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
 #if !defined(_MSC_VER) && !defined(__forceinline)
 #define __forceinline inline __attribute__((always_inline))
