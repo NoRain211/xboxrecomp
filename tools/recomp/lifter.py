@@ -2374,20 +2374,24 @@ class Lifter:
             return [f"fp_top() = sqrt(fp_top()); /* fsqrt */"]
         # Transcendentals. fpatan is the core of the atan2 helper the
         # view-matrix path calls; dropping it left an unbalanced stack value.
+        # They go through recomp_sin and friends, which a project's
+        # recomp_types.h maps to the host's libm or, for netplay, to one
+        # implementation every host computes alike.
         if m == "fpatan":
-            return [f"fp_st1() = atan2(fp_st1(), fp_top()); fp_pop();"
+            return [f"fp_st1() = recomp_atan2(fp_st1(), fp_top()); fp_pop();"
                     f" /* fpatan */"]
         if m == "fsin":
-            return [f"fp_top() = sin(fp_top()); /* fsin */"]
+            return [f"fp_top() = recomp_sin(fp_top()); /* fsin */"]
         if m == "fcos":
-            return [f"fp_top() = cos(fp_top()); /* fcos */"]
+            return [f"fp_top() = recomp_cos(fp_top()); /* fcos */"]
         if m == "fsincos":
-            return [f"{{ double _s = sin(fp_top()); "
-                    f"fp_top() = cos(fp_top()); fp_push(_s); }} /* fsincos */"]
+            return [f"{{ double _s = recomp_sin(fp_top()); "
+                    f"fp_top() = recomp_cos(fp_top()); fp_push(_s); }} /* fsincos */"]
         if m == "fptan":
-            return [f"fp_top() = tan(fp_top()); fp_push(1.0); /* fptan */"]
+            return [f"fp_top() = recomp_tan(fp_top()); fp_push(1.0); /* fptan */"]
         if m == "f2xm1":
-            return [f"fp_top() = pow(2.0, fp_top()) - 1.0; /* f2xm1 */"]
+            # 2^x - 1 as expm1(x ln 2), which also keeps the bits near 0.
+            return [f"fp_top() = recomp_expm1(fp_top() * 0.69314718055994530942); /* f2xm1 */"]
         if m == "fprem":
             return [
                 "{ fp_top() = fmod(fp_top(), fp_st1()); "
@@ -2395,10 +2399,10 @@ class Lifter:
                 "/* fprem: complete, C2 clear */"
             ]
         if m == "fyl2x":
-            return [f"fp_st1() = fp_st1() * log2(fp_top()); fp_pop();"
+            return [f"fp_st1() = fp_st1() * recomp_log2(fp_top()); fp_pop();"
                     f" /* fyl2x */"]
         if m == "fyl2xp1":
-            return [f"fp_st1() = fp_st1() * log2(fp_top() + 1.0); fp_pop();"
+            return [f"fp_st1() = fp_st1() * recomp_log2(fp_top() + 1.0); fp_pop();"
                     f" /* fyl2xp1 */"]
         if m == "fscale":
             return [f"fp_top() = fp_top() * pow(2.0, trunc(fp_st1()));"
