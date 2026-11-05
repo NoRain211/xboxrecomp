@@ -2671,7 +2671,12 @@ class Lifter:
             return skipped
         below = self._leading_arms(self._read_jump_table_backward(table_va - 4))
         if len(below) >= 2:
-            return below
+            # The slot at the displacement belongs to a table indexed downward
+            # (jmp [-index*4 + base]) when it lands in the function too. SC2's
+            # PAL 0x0014B810 dispatches through [0x0014BAA8] with seven arms
+            # below it and its eighth at it; dropping that arm left an
+            # unresolved indirect jump (the attract demo stopped with code 2).
+            return inside + below
         return []
 
     def _table_word(self, va):

@@ -72,6 +72,13 @@ def test_arms_below_the_base():
                          "negative-index table")
 
 
+def test_arms_below_and_at_the_base():
+    # neg ecx; jmp [ecx*4 + TABLE+8] -- arms below the base and one at it,
+    # code after it (SC2 PAL 0x0014B810: seven below, the eighth at the base)
+    code = _translate(_image(b"\xF7\xD9", TABLE + 8))
+    _assert_local_switch(code, "table indexed downward to its base")
+
+
 def _single_arm_image(after):
     """jmp [eax*4 + TABLE]; table [arm, after]; arm: mov eax, 1; ret."""
     code = b"\xFF\x24\x85" + TABLE.to_bytes(4, "little")
@@ -93,5 +100,6 @@ def test_single_arm_ended_by_null_slot():
 if __name__ == "__main__":
     test_index_starts_at_one()
     test_arms_below_the_base()
+    test_arms_below_and_at_the_base()
     test_single_arm_ended_by_null_slot()
     print("ok")
