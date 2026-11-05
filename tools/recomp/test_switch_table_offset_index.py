@@ -72,7 +72,15 @@ def test_arms_below_the_base():
                          "negative-index table")
 
 
+def test_arms_below_and_at_the_base():
+    # neg ecx; jmp [ecx*4 + TABLE+8] -- arms below the base and one at it,
+    # code after it (SC2 PAL 0x0014B810: seven below, the eighth at the base)
+    code = _translate(_image(b"\xF7\xD9", TABLE + 8))
+    _assert_local_switch(code, "table indexed downward to its base")
+
+
 if __name__ == "__main__":
     test_index_starts_at_one()
     test_arms_below_the_base()
+    test_arms_below_and_at_the_base()
     print("ok")
