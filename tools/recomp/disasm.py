@@ -154,9 +154,19 @@ class Disassembler:
         self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
         _init_reg_names(self._cs)
+        # Discovery passes decode each function about three times; the image
+        # never changes, and Instructions are not mutated after decoding.
+        self._decoded = {}
 
     def _decode_instruction(self, cs_insn):
         """Convert one Capstone instruction into the translator model."""
+        cached = self._decoded.get(cs_insn.address)
+        if cached is not None and cached.size == cs_insn.size:
+            return cached
+        insn = self._decoded[cs_insn.address] = self._decode_uncached(cs_insn)
+        return insn
+
+    def _decode_uncached(self, cs_insn):
         insn = Instruction(
             address=cs_insn.address,
             size=cs_insn.size,
