@@ -2660,7 +2660,7 @@ class Lifter:
         if len(skipped) >= 2:
             return skipped
         below = self._leading_arms(self._read_jump_table_backward(table_va - 4))
-        if len(below) >= 2:
+        if len(inside) + len(below) >= 2:
             # The slot at the displacement belongs to a table indexed downward
             # (jmp [-index*4 + base]) when it lands in the function too. SC2's
             # PAL 0x0014B810 dispatches through [0x0014BAA8] with seven arms
