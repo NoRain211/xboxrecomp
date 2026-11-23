@@ -173,6 +173,32 @@ class Disassembler:
         self._cs = Cs(CS_ARCH_X86, CS_MODE_32)
         self._cs.detail = True
         _init_reg_names(self._cs)
+        # A lift decodes each function several times, and an instruction's
+        # decode depends only on its address and bytes, so keep each one.
+        self._decoded = {}
+
+    def _decode_at(self, raw_bytes, start_va, size, address):
+        """The instruction at address in raw_bytes[:size], or None where
+        Capstone stops (invalid bytes, or an instruction cut off at size)."""
+        offset = address - start_va
+        window = bytes(raw_bytes[offset:min(offset + 15, size)])  # 15: the longest x86 instruction
+        key = (address, window)
+        insn = self._decoded.get(key, self._decoded)
+        if insn is self._decoded:
+            cs_insn = next(self._cs.disasm(window, address, 1), None)
+            insn = self._decode_instruction(cs_insn) if cs_insn else None
+            self._decoded[key] = insn
+        return insn
+
+    def _sweep(self, raw_bytes, start_va, size, address):
+        """Decode linearly from address, as Capstone does over
+        raw_bytes[address - start_va:size]."""
+        while address < start_va + size:
+            insn = self._decode_at(raw_bytes, start_va, size, address)
+            if insn is None:
+                return
+            yield insn
+            address += insn.size
 
     def _decode_instruction(self, cs_insn):
         """Convert one Capstone instruction into the translator model."""
@@ -241,8 +267,8 @@ class Disassembler:
             return []
 
         decoded = {}
-        for cs_insn in self._cs.disasm(raw_bytes[:size], start_va):
-            decoded[cs_insn.address] = self._decode_instruction(cs_insn)
+        for insn in self._sweep(raw_bytes, start_va, size, start_va):
+            decoded[insn.address] = insn
 
         for point in sorted(resync or ()):
             if not (start_va <= point < end_va) or point in decoded:
@@ -250,16 +276,14 @@ class Disassembler:
             for addr in [a for a, i in decoded.items()
                          if a < point < a + i.size]:
                 del decoded[addr]
-            for cs_insn in self._cs.disasm(raw_bytes[point - start_va:size],
-                                           point):
-                if cs_insn.address in decoded:
+            for insn in self._sweep(raw_bytes, start_va, size, point):
+                if insn.address in decoded:
                     break          # rejoined a stream we already have
                 # The old misaligned stream can start inside this instruction
                 # and would otherwise run as part of the same block.
-                for addr in range(cs_insn.address + 1,
-                                  cs_insn.address + cs_insn.size):
+                for addr in range(insn.address + 1, insn.end_address):
                     decoded.pop(addr, None)
-                decoded[cs_insn.address] = self._decode_instruction(cs_insn)
+                decoded[insn.address] = insn
 
         return [decoded[a] for a in sorted(decoded)]
 
@@ -277,13 +301,11 @@ class Disassembler:
             entry = worklist.pop()
             if not (start_va <= entry < end_va) or entry in decoded:
                 continue
-            offset = entry - start_va
-            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
-                if cs_insn.address != entry and cs_insn.address in stop_addresses:
+            for insn in self._sweep(raw_bytes, start_va, size, entry):
+                if insn.address != entry and insn.address in stop_addresses:
                     break
-                if cs_insn.address >= end_va or cs_insn.address in decoded:
+                if insn.address >= end_va or insn.address in decoded:
                     break
-                insn = self._decode_instruction(cs_insn)
                 decoded[insn.address] = insn
 
                 if (insn.is_cond_jump and insn.jump_target is not None
