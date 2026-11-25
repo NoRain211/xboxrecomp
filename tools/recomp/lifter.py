@@ -2590,7 +2590,15 @@ class Lifter:
     def _read_jump_table(self, table_va, max_entries=256):
         """Read 32-bit jump table entries from the XBE at a given VA.
         Returns list of target addresses. Stops when an entry is not a
-        valid code address or max_entries is reached."""
+        valid code address or max_entries is reached.
+
+        Zero slots are holes, not the end of the table: a dispatcher can
+        route some indices away from this table before a second table entry
+        that shares the remaining arms. DOA2U's online lobby settings
+        dispatch (0x002B3233) has two such holes, and stopping at the first
+        one dropped the live arms 0x002B3260 and 0x002B3253. The emitted
+        switch compares the loaded word against its arms, so a hole never
+        becomes a target and the scan only needs to keep going."""
         if not self.xbe_data:
             return []
         offset = va_to_file_offset(table_va)
@@ -2602,6 +2610,8 @@ class Lifter:
             if o + 4 > len(self.xbe_data):
                 break
             val = struct.unpack_from('<I', self.xbe_data, o)[0]
+            if val == 0:
+                continue
             if not is_code_address(val):
                 break
             targets.append(val)
